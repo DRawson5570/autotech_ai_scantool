@@ -13,10 +13,7 @@ REM Check Python
 python --version >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Python not found!
-    echo.
     echo Install Python 3.10+ from https://python.org
-    echo Make sure to check "Add Python to PATH" during install.
-    echo.
     pause
     exit /b 1
 )
@@ -39,9 +36,9 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Build
+REM Build single-file exe
 echo [3/3] Building executable...
-pyinstaller gateway_app.spec --noconfirm
+python -m PyInstaller gateway_app.spec --noconfirm
 if errorlevel 1 (
     echo.
     echo BUILD FAILED. Check errors above.
@@ -54,12 +51,8 @@ echo ========================================
 echo  BUILD SUCCESSFUL!
 echo ========================================
 echo.
-echo  Output: dist\ELM327_Gateway\ELM327_Gateway.exe
+echo  Output: dist\ELM327_Gateway.exe
 echo.
-echo  To run:
-echo    dist\ELM327_Gateway\ELM327_Gateway.exe
-echo.
-echo  To run headless (no tray icon):
-echo    dist\ELM327_Gateway\ELM327_Gateway.exe --headless
+echo  Just send that single file to anyone!
 echo.
 pause

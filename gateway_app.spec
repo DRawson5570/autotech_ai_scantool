@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for ELM327 Gateway App.
+PyInstaller spec for ELM327 Gateway App - Single File Build.
 
 Build with:
     pip install pyinstaller
-    pyinstaller gateway_app.spec --noconfirm
+    python -m PyInstaller gateway_app.spec --noconfirm
 
-Output: dist/ELM327_Gateway/ELM327_Gateway.exe
+Output: dist/ELM327_Gateway.exe (single file!)
 """
 
 block_cipher = None
@@ -68,29 +68,20 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='ELM327_Gateway',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # No console window (tray app)
+    console=True,  # Console visible for debugging
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # TODO: add car icon
-)
-
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='ELM327_Gateway',
+    icon=None,
 )
