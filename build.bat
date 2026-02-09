@@ -20,7 +20,7 @@ if errorlevel 1 (
 
 REM Install dependencies
 echo [1/3] Installing dependencies...
-pip install -r requirements.txt pyinstaller
+python -m pip install -r requirements.txt pyinstaller
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies.
     pause
