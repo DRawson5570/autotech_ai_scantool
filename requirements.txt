@@ -1,0 +1,7 @@
+pyserial>=3.5
+aiohttp>=3.9
+uvicorn>=0.24
+fastapi>=0.104
+pydantic>=2.0
+pystray>=0.19
+Pillow>=10.0

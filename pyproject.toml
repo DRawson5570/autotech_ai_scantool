@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elm327-gateway"
+version = "1.0.0"
+description = "One-click ELM327/OBDLink gateway for Autotech AI diagnostics"
+readme = "README.md"
+license = {text = "Proprietary"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Autotech AI", email = "support@aurora-sentient.net"},
+]
+dependencies = [
+    "pyserial>=3.5",
+    "aiohttp>=3.9",
+    "uvicorn>=0.24",
+    "fastapi>=0.104",
+    "pydantic>=2.0",
+    "pystray>=0.19",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+elm327-gateway = "elm327_gateway.app:main"
+
+[tool.setuptools.packages.find]
+include = ["elm327_gateway*"]
