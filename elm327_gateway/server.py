@@ -84,7 +84,7 @@ def start_mdns_service(port: int):
             )
         }
         _mdns_service['zeroconf'].register_service(_mdns_service['info'])
-        logger.info(f"📡 mDNS service registered: http://{hostname}.local:{port}/ui")
+        logger.info(f"mDNS service registered: http://{hostname}.local:{port}/ui")
         return True
     except ImportError:
         logger.warning("zeroconf not installed - mDNS discovery disabled")

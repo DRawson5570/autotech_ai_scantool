@@ -161,7 +161,7 @@ async def detect_elm327(timeout_per_port: float = 3.0) -> List[DetectedAdapter]:
             # Refine port type from description
             adapter.port_type = _guess_port_type(port, candidate.get("description", ""))
             detected.append(adapter)
-            logger.info(f"✅ Found {adapter.name} on {port} ({adapter.port_type})")
+            logger.info(f"Found {adapter.name} on {port} ({adapter.port_type})")
     
     if not detected:
         logger.info("No ELM327 adapters found")
@@ -188,15 +188,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     async def main():
-        print("🔍 Scanning for ELM327 adapters...")
+        print("Scanning for ELM327 adapters...")
         adapters = await detect_elm327()
         
         if adapters:
-            print(f"\n✅ Found {len(adapters)} adapter(s):")
+            print(f"\n[OK] Found {len(adapters)} adapter(s):")
             for a in adapters:
                 print(f"  • {a.name} ({a.version}) on {a.port} [{a.port_type}]")
         else:
-            print("\n❌ No adapters found")
+            print("\n[ERR] No adapters found")
             print("Make sure:")
             print("  - OBDLink MX+ is plugged into the car")
             print("  - Ignition is ON")

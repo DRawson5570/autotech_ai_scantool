@@ -156,7 +156,7 @@ class GatewayTunnel:
             logger.error(f"Server error: {msg.get('message')}")
         
         elif msg_type == "registered":
-            self._status(f"✅ Registered as shop '{self.shop_id}'")
+            self._status(f"[OK] Registered as shop '{self.shop_id}'")
         
         else:
             logger.debug(f"Unknown message type: {msg_type}")
@@ -169,7 +169,7 @@ class GatewayTunnel:
         session = await self._get_session()
         
         try:
-            self._status(f"🔗 Connecting to {self.ws_url}...")
+            self._status(f"Connecting to {self.ws_url}...")
             
             self._ws = await session.ws_connect(
                 self.ws_url,
@@ -186,7 +186,7 @@ class GatewayTunnel:
             }))
             
             self._connected = True
-            self._status("✅ Connected to server")
+            self._status("[OK] Connected to server")
             self._reconnect_delay = 5  # Reset backoff
             
             # Message loop
@@ -202,10 +202,10 @@ class GatewayTunnel:
             return True
             
         except aiohttp.ClientConnectorError as e:
-            self._status(f"❌ Cannot reach server: {e}")
+            self._status(f"[ERR] Cannot reach server: {e}")
             return False
         except Exception as e:
-            self._status(f"❌ Connection error: {e}")
+            self._status(f"[ERR] Connection error: {e}")
             return False
         finally:
             self._connected = False
@@ -227,7 +227,7 @@ class GatewayTunnel:
             if not self._running:
                 break
             
-            self._status(f"🔄 Reconnecting in {self._reconnect_delay}s...")
+            self._status(f"Reconnecting in {self._reconnect_delay}s...")
             await asyncio.sleep(self._reconnect_delay)
             
             # Exponential backoff
@@ -236,7 +236,7 @@ class GatewayTunnel:
                 self._max_reconnect_delay
             )
         
-        self._status("⏹ Tunnel stopped")
+        self._status("Tunnel stopped")
     
     async def stop(self):
         """Stop the tunnel."""

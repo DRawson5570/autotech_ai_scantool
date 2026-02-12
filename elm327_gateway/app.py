@@ -30,12 +30,16 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "gateway.log"
 CONFIG_FILE = LOG_DIR / "config.json"
 
+# Use UTF-8 for file, and errors='replace' on console to avoid
+# UnicodeEncodeError on Windows cp1252 consoles with emoji/unicode.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(
+            open(sys.stdout.fileno(), mode='w', encoding='utf-8', errors='replace', closefd=False)
+        ),
     ]
 )
 logger = logging.getLogger("gateway_app")
@@ -124,7 +128,7 @@ class GatewayApp:
                 self._update_status(f"Found {adapter.name} on {adapter.port}")
                 return adapter.port
             else:
-                self._update_status("❌ No ELM327 found")
+                self._update_status("[ERR] No ELM327 found")
                 return None
         except Exception as e:
             logger.error(f"Auto-detect error: {e}")
@@ -202,12 +206,12 @@ class GatewayApp:
                     if resp.status == 200:
                         result = await resp.json()
                         vin = result.get("vin", "N/A")
-                        self._update_status(f"✅ Connected - VIN: {vin}")
+                        self._update_status(f"[OK] Connected - VIN: {vin}")
                     else:
                         error = await resp.text()
-                        self._update_status(f"❌ Connect failed: {error[:50]}")
+                        self._update_status(f"[ERR] Connect failed: {error[:50]}")
         except Exception as e:
-            self._update_status(f"❌ Connect error: {e}")
+            self._update_status(f"[ERR] Connect error: {e}")
     
     async def run_async(self):
         """Main async entry point."""
@@ -334,7 +338,7 @@ def first_run_setup() -> dict:
     # Shop ID
     shop_id = input("Enter your Shop ID (provided by Autotech AI): ").strip()
     if not shop_id:
-        print("❌ Shop ID is required")
+        print("[ERR] Shop ID is required")
         sys.exit(1)
     config["shop_id"] = shop_id
     
@@ -354,7 +358,7 @@ def first_run_setup() -> dict:
     # Save
     save_config(config)
     print()
-    print(f"✅ Configuration saved to {CONFIG_FILE}")
+    print(f"[OK] Configuration saved to {CONFIG_FILE}")
     print()
     
     return config
