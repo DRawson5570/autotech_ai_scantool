@@ -116,7 +116,7 @@ class GatewayApp:
     
     async def _detect_adapter(self) -> Optional[str]:
         """Auto-detect the ELM327 adapter port."""
-        self._update_status("🔍 Scanning for ELM327...")
+        self._update_status("Scanning for ELM327...")
         
         try:
             from elm327_gateway.autodetect import detect_and_pick
@@ -162,7 +162,7 @@ class GatewayApp:
         api_key = self.config.get("api_key", "")
         
         if not shop_id:
-            self._update_status("⚠️ No shop ID configured")
+            self._update_status("[WARN] No shop ID configured")
             return
         
         self._tunnel = GatewayTunnel(
@@ -183,7 +183,7 @@ class GatewayApp:
             # Auto-detect
             port = await self._detect_adapter()
             if not port:
-                self._update_status("⚠️ No adapter - will retry in 30s")
+                self._update_status("[WARN] No adapter - will retry in 30s")
                 await asyncio.sleep(30)
                 return
         
@@ -326,7 +326,7 @@ def first_run_setup() -> dict:
     """Interactive first-run setup (console)."""
     print()
     print("=" * 60)
-    print("  🚗 Autotech AI - ELM327 Gateway Setup")
+    print("  Autotech AI - ELM327 Gateway Setup")
     print("=" * 60)
     print()
     print("This gateway connects your ELM327 OBD-II adapter to")

@@ -152,7 +152,7 @@ _server_port = 8327
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    logger.info("🚗 ELM327 Gateway starting...")
+    logger.info("ELM327 Gateway starting...")
     start_mdns_service(_server_port)
     yield
     # Cleanup on shutdown
@@ -1183,24 +1183,24 @@ if __name__ == "__main__":
     hostname = socket.gethostname()
     
     print(f"""
-╔══════════════════════════════════════════════════════════════╗
-║                    ELM327 Gateway Server                     ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  📱 iPhone/iPad (Bonjour auto-discovery):                    ║
-║     http://{hostname}.local:{args.port}/ui{' ' * (27 - len(hostname) - len(str(args.port)))}║
-║                                                              ║
-║  📱 Any device (direct IP):                                  ║
-║     http://{local_ip}:{args.port}/ui{' ' * (33 - len(local_ip) - len(str(args.port)))}║
-║                                                              ║
-║  📷 Scan QR code:                                            ║
-║     http://{local_ip}:{args.port}/qr{' ' * (33 - len(local_ip) - len(str(args.port)))}║
-║                                                              ║
-╠══════════════════════════════════════════════════════════════╣
-║  Windows: Use COMx port (check Device Manager)               ║
-║  Linux:   Use /dev/rfcomm0 (run setup_bluetooth.sh first)    ║
-║  WiFi:    Use 192.168.0.10:35000                             ║
-╚══════════════════════════════════════════════════════════════╝
++==============================================================+
+|                    ELM327 Gateway Server                     |
++==============================================================+
+|                                                              |
+|  iPhone/iPad (Bonjour auto-discovery):                       |
+|     http://{hostname}.local:{args.port}/ui{' ' * (27 - len(hostname) - len(str(args.port)))}|
+|                                                              |
+|  Any device (direct IP):                                     |
+|     http://{local_ip}:{args.port}/ui{' ' * (33 - len(local_ip) - len(str(args.port)))}|
+|                                                              |
+|  Scan QR code:                                               |
+|     http://{local_ip}:{args.port}/qr{' ' * (33 - len(local_ip) - len(str(args.port)))}|
+|                                                              |
++==============================================================+
+|  Windows: Use COMx port (check Device Manager)               |
+|  Linux:   Use /dev/rfcomm0 (run setup_bluetooth.sh first)    |
+|  WiFi:    Use 192.168.0.10:35000                             |
++==============================================================+
 """)
     
     uvicorn.run(app, host=args.host, port=args.port)

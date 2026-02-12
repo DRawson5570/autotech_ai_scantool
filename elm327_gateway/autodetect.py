@@ -194,7 +194,7 @@ if __name__ == "__main__":
         if adapters:
             print(f"\n[OK] Found {len(adapters)} adapter(s):")
             for a in adapters:
-                print(f"  • {a.name} ({a.version}) on {a.port} [{a.port_type}]")
+            print(f"  - {a.name} ({a.version}) on {a.port} [{a.port_type}]")
         else:
             print("\n[ERR] No adapters found")
             print("Make sure:")

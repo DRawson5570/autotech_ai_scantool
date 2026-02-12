@@ -130,7 +130,7 @@ class GatewayTunnel:
             path = msg.get("path", "/")
             body = msg.get("body")
             
-            logger.info(f"← Request {request_id}: {method} {path}")
+            logger.info(f"<-- Request {request_id}: {method} {path}")
             
             # Forward to local gateway
             result = await self._forward_to_local(method, path, body)
@@ -145,7 +145,7 @@ class GatewayTunnel:
             
             if self._ws and not self._ws.closed:
                 await self._ws.send_str(json.dumps(response))
-                logger.info(f"→ Response {request_id}: {result['status']}")
+                logger.info(f"--> Response {request_id}: {result['status']}")
         
         elif msg_type == "ping":
             # Server keepalive
