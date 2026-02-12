@@ -21,6 +21,7 @@ a = Analysis(
         'serial',
         'serial.tools',
         'serial.tools.list_ports',
+        'serial_asyncio',
         'uvicorn',
         'uvicorn.logging',
         'uvicorn.loops',
