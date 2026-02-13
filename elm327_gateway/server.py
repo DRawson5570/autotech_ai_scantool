@@ -141,6 +141,11 @@ class HypothesisRequest(BaseModel):
     confidence: float
     reasoning: str
 
+class ActuatorRequest(BaseModel):
+    actuator: str  # cooling_fan, evap_purge, evap_vent, ac_clutch, fuel_pump, etc.
+    state: str = "on"  # on, off, default
+    duration: float = 5.0  # Auto-release after seconds
+
 
 # =============================================================================
 # FastAPI App
@@ -548,6 +553,69 @@ async def read_fuel_trims(user_id: str = "default"):
         
         return {"fuel_trims": results, "timestamp": datetime.now().isoformat()}
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/actuators")
+async def list_actuators():
+    """List available actuators and probe which ones the vehicle supports."""
+    _require_connection()
+    
+    try:
+        if _elm._actuator_control:
+            supported = await _elm._actuator_control.get_supported_actuators()
+        else:
+            supported = []
+        
+        from elm327_gateway.bidirectional import STANDARD_ACTUATORS, ActuatorType
+        
+        actuators = []
+        for act_type, defn in STANDARD_ACTUATORS.items():
+            actuators.append({
+                "id": act_type.value,
+                "name": defn.name,
+                "description": defn.description,
+                "supported": act_type in supported,
+                "states": [s.value for s in defn.supported_states]
+            })
+        
+        return {
+            "actuators": actuators,
+            "supported_count": len(supported),
+            "total_count": len(actuators),
+            "warning": "Actuator control directly commands vehicle components. Use with caution."
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/actuator")
+async def control_actuator(req: ActuatorRequest):
+    """Control a vehicle actuator (bidirectional control)."""
+    _require_connection()
+    
+    try:
+        success = await _elm.actuator_test(req.actuator, req.state, req.duration)
+        
+        if success:
+            return {
+                "status": "success",
+                "actuator": req.actuator,
+                "state": req.state,
+                "duration": req.duration,
+                "message": f"{req.actuator} commanded {req.state.upper()} for {req.duration}s. Verify operation physically."
+            }
+        else:
+            return {
+                "status": "unsupported",
+                "actuator": req.actuator,
+                "message": f"{req.actuator} actuator test not supported on this vehicle (Mode $08 may not be available)"
+            }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

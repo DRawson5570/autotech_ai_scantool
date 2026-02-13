@@ -91,6 +91,27 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         tid=0x05,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.CYCLE],
     ),
+    ActuatorType.EGR_VALVE: ActuatorDefinition(
+        actuator_type=ActuatorType.EGR_VALVE,
+        name="EGR Valve",
+        description="Exhaust gas recirculation valve",
+        tid=0x06,
+        supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+    ),
+    ActuatorType.AIR_PUMP: ActuatorDefinition(
+        actuator_type=ActuatorType.AIR_PUMP,
+        name="Secondary Air Pump",
+        description="Secondary air injection pump relay",
+        tid=0x07,
+        supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+    ),
+    ActuatorType.CANISTER_PURGE: ActuatorDefinition(
+        actuator_type=ActuatorType.CANISTER_PURGE,
+        name="Canister Purge Valve",
+        description="Carbon canister purge control valve",
+        tid=0x08,
+        supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+    ),
 }
 
 
