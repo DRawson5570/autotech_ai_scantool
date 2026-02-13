@@ -166,11 +166,52 @@ class SerialConnection(ELM327Connection):
         self._connected = False
         logger.info("Serial connection closed")
     
+    async def _wake_up(self) -> None:
+        """
+        Wake up Bluetooth ELM327 adapters.
+        
+        Cheap BT clones drop into sleep after pairing. Windows scan tools
+        keep them awake by sending CR bytes. We do the same: send CRs
+        and wait for the '>' prompt, retrying several times.
+        """
+        logger.info("Waking up ELM327 (Bluetooth wake sequence)...")
+        
+        for attempt in range(5):
+            try:
+                # Send bare carriage return to poke the adapter
+                self._writer.write(b"\r\n")
+                await self._writer.drain()
+                
+                # Wait for any response (even partial)
+                buffer = b""
+                try:
+                    chunk = await asyncio.wait_for(
+                        self._reader.read(1024),
+                        timeout=2.0
+                    )
+                    buffer = chunk or b""
+                except asyncio.TimeoutError:
+                    pass
+                
+                if buffer:
+                    decoded = buffer.decode('ascii', errors='ignore').strip()
+                    logger.info(f"Wake attempt {attempt + 1}: got response ({len(buffer)} bytes): {decoded[:50]}")
+                    return  # Adapter is awake
+                else:
+                    logger.info(f"Wake attempt {attempt + 1}: no response, retrying...")
+                    await asyncio.sleep(1.0)
+                    
+            except Exception as e:
+                logger.warning(f"Wake attempt {attempt + 1} error: {e}")
+                await asyncio.sleep(1.0)
+        
+        logger.warning("ELM327 did not respond to wake sequence, proceeding anyway...")
+
     async def _initialize(self) -> None:
         """Initialize ELM327 adapter."""
-        # Reset
-        await self.send_command("ATZ", timeout=3.0)
-        await asyncio.sleep(1.0)  # Give it time to reset
+        # Reset - use longer timeout for Bluetooth adapters
+        await self.send_command("ATZ", timeout=10.0)
+        await asyncio.sleep(2.0)  # Give it time to reset (BT clones are slow)
         
         # Disable echo
         await self.send_command("ATE0")

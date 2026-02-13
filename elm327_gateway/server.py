@@ -383,6 +383,26 @@ async def connect(req: ConnectRequest):
         _elm = ELM327Service()
         success = await _elm.connect(req.connection_type, req.address)
         
+        if not success and platform.system() == "Windows" and req.address.upper().startswith("COM"):
+            # COM port failed - try other available Bluetooth COM ports
+            logger.info(f"Primary port {req.address} failed, scanning other COM ports...")
+            import serial
+            for i in range(1, 21):
+                port = f"COM{i}"
+                if port.upper() == req.address.upper():
+                    continue  # Skip the one we already tried
+                try:
+                    s = serial.Serial(port)
+                    s.close()
+                    logger.info(f"Trying alternate port: {port}")
+                    _elm = ELM327Service()
+                    success = await _elm.connect(req.connection_type, port)
+                    if success:
+                        logger.info(f"Connected on alternate port: {port}")
+                        break
+                except:
+                    pass
+        
         if success:
             _connected_at = datetime.now()
             supported = await _elm.get_supported_pids()

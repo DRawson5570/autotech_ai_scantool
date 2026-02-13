@@ -30,6 +30,13 @@ LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "gateway.log"
 CONFIG_FILE = LOG_DIR / "config.json"
 
+# When running as a windowed app (console=False), sys.stdout/stderr are None.
+# Redirect them to devnull so libraries (uvicorn, aiohttp, etc.) don't crash.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 # Use UTF-8 for file, and errors='replace' on console to avoid
 # UnicodeEncodeError on Windows cp1252 consoles with emoji/unicode.
 logging.basicConfig(
@@ -151,7 +158,11 @@ class GatewayApp:
         server = uvicorn.Server(config)
         
         self._update_status(f"Gateway server on port {port}")
-        await server.serve()
+        try:
+            await server.serve()
+        except Exception as e:
+            logger.error(f"Gateway server crashed: {e}", exc_info=True)
+            self._update_status(f"[ERR] Server crashed: {e}")
     
     async def _start_tunnel(self):
         """Start the reverse WebSocket tunnel."""
