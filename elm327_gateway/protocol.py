@@ -359,6 +359,10 @@ class OBDProtocol:
         """
         Parse multi-frame OBD response (like VIN).
         
+        Handles both formats:
+        - Standard: "49 02 01 31 34 33 34 ..."
+        - CAN ISO-TP: "0:49020131343334\\n1:52444A44..."
+        
         Args:
             response: Raw multi-line response
             
@@ -366,18 +370,31 @@ class OBDProtocol:
             Combined data bytes
         """
         all_bytes = []
+        is_first_frame = True
         
         for line in response.split('\n'):
             line = line.strip()
             if not line:
                 continue
             
-            # Remove any non-hex characters
+            # Strip CAN ISO-TP frame index prefix (e.g., "0:", "1:", "2:")
+            if len(line) > 2 and line[1] == ':' and line[0].isdigit():
+                line = line[2:]
+            # Also handle "0A:", "0B:" etc for frames > 9
+            elif len(line) > 3 and line[2] == ':' and line[:2].isalnum():
+                line = line[3:]
+            
+            # Remove any non-hex characters (spaces, colons, etc.)
             hex_str = ''.join(c for c in line if c in '0123456789ABCDEFabcdef')
             
-            # Skip header bytes (49 02 XX for mode 09 responses)
-            if hex_str.startswith('4902') or hex_str.startswith('4904'):
-                hex_str = hex_str[6:]  # Skip "4902XX"
+            if not hex_str:
+                continue
+            
+            # Skip header bytes on first frame (49 02 XX for mode 09 responses)
+            if is_first_frame:
+                if hex_str.startswith('4902') or hex_str.startswith('4904'):
+                    hex_str = hex_str[6:]  # Skip "4902XX" (response + PID + count)
+                is_first_frame = False
             
             # Convert to bytes
             for i in range(0, len(hex_str), 2):
