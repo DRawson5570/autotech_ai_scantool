@@ -32,7 +32,7 @@ class ConnectionConfig:
     """Connection configuration."""
     connection_type: ConnectionType
     address: str  # Device path or IP:port
-    baudrate: int = 38400  # For serial connections
+    baudrate: int = 9600  # For serial connections (cheap BT clones use 9600)
     timeout: float = 5.0
     
     # WiFi-specific
@@ -134,22 +134,65 @@ class SerialConnection(ELM327Connection):
         super().__init__(config)
         self._serial = None
     
+    # Common baud rates for ELM327 adapters (ordered by likelihood)
+    BAUD_RATES = [9600, 38400, 115200, 57600, 19200]
+    
     async def connect(self) -> bool:
-        """Connect via serial port."""
+        """Connect via serial port with baud rate auto-detection."""
         try:
             import serial_asyncio
             
-            self._reader, self._writer = await serial_asyncio.open_serial_connection(
-                url=self.config.address,
-                baudrate=self.config.baudrate,
-            )
-            self._connected = True
+            # Try the configured baud rate first, then others
+            rates_to_try = [self.config.baudrate] + [
+                r for r in self.BAUD_RATES if r != self.config.baudrate
+            ]
             
-            # Initialize ELM327
-            await self._initialize()
+            for baudrate in rates_to_try:
+                logger.info(f"Trying baud rate {baudrate} on {self.config.address}...")
+                try:
+                    # Close previous attempt if any
+                    if self._writer:
+                        try:
+                            self._writer.close()
+                            await self._writer.wait_closed()
+                        except Exception:
+                            pass
+                        self._writer = None
+                        self._reader = None
+                    
+                    self._reader, self._writer = await serial_asyncio.open_serial_connection(
+                        url=self.config.address,
+                        baudrate=baudrate,
+                    )
+                    self._connected = True
+                    
+                    # Wake up and test with ATI (identity)
+                    await self._wake_up()
+                    
+                    # Quick test: send ATI and see if we get a real response
+                    response = await self.send_command("ATI", timeout=3.0)
+                    if response and "ELM" in response.upper():
+                        logger.info(f"ELM327 detected at {baudrate} baud: {response}")
+                        self.config.baudrate = baudrate
+                        await self._initialize()
+                        logger.info(f"Connected to ELM327 via serial: {self.config.address} @ {baudrate}")
+                        return True
+                    elif response:
+                        logger.info(f"Got response at {baudrate} but not ELM327: {response[:50]}")
+                        # Still might work - try initializing
+                        self.config.baudrate = baudrate
+                        await self._initialize()
+                        logger.info(f"Connected to ELM327 via serial: {self.config.address} @ {baudrate}")
+                        return True
+                    else:
+                        logger.info(f"No response at {baudrate} baud")
+                        
+                except Exception as e:
+                    logger.warning(f"Baud {baudrate} failed: {e}")
             
-            logger.info(f"Connected to ELM327 via serial: {self.config.address}")
-            return True
+            logger.error(f"ELM327 not responding at any baud rate on {self.config.address}")
+            self._connected = False
+            return False
             
         except ImportError:
             logger.error("pyserial-asyncio not installed. Run: pip install pyserial-asyncio")
@@ -206,7 +249,7 @@ class SerialConnection(ELM327Connection):
                 await asyncio.sleep(1.0)
         
         logger.warning("ELM327 did not respond to wake sequence, proceeding anyway...")
-
+    
     async def _initialize(self) -> None:
         """Initialize ELM327 adapter."""
         # Reset - use longer timeout for Bluetooth adapters
