@@ -376,9 +376,17 @@ async def connect(req: ConnectRequest):
     global _elm, _connected_at
     
     try:
-        # Disconnect existing
+        # If already connected to the same address, skip reconnection
         if _elm and _elm.connected:
-            await _elm.disconnect()
+            vin = _elm.vin
+            supported = await _elm.get_supported_pids()
+            logger.info(f"Already connected, skipping reconnection (VIN: {vin})")
+            return {
+                "status": "connected",
+                "vin": vin,
+                "supported_pids": len(supported),
+                "address": req.address
+            }
         
         _elm = ELM327Service()
         success = await _elm.connect(req.connection_type, req.address)

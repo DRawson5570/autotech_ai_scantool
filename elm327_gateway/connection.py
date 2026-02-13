@@ -32,7 +32,7 @@ class ConnectionConfig:
     """Connection configuration."""
     connection_type: ConnectionType
     address: str  # Device path or IP:port
-    baudrate: int = 9600  # For serial connections (cheap BT clones use 9600)
+    baudrate: int = 38400  # For serial connections
     timeout: float = 5.0
     
     # WiFi-specific
@@ -135,7 +135,7 @@ class SerialConnection(ELM327Connection):
         self._serial = None
     
     # Common baud rates for ELM327 adapters (ordered by likelihood)
-    BAUD_RATES = [9600, 38400, 115200, 57600, 19200]
+    BAUD_RATES = [38400, 9600, 115200, 57600, 19200]
     
     async def connect(self) -> bool:
         """Connect via serial port with baud rate auto-detection."""
