@@ -273,18 +273,21 @@ class OBDProtocol:
             17-character VIN string or None
         """
         # Request VIN (InfoType 02)
-        response = await self.connection.send_command("0902")
+        response = await self.connection.send_command("0902", timeout=5.0)
+        logger.info(f"VIN raw response: {repr(response)}")
         
-        if "NO DATA" in response or "ERROR" in response:
+        if not response or "NO DATA" in response or "ERROR" in response:
             return None
         
         # VIN response: 49 02 01 XX XX XX XX ... (multi-frame)
         # Need to extract ASCII characters
         data = self._parse_multiframe_response(response)
+        logger.info(f"VIN parsed bytes ({len(data)}): {[hex(b) for b in data[:20]]}")
         if data and len(data) >= 17:
             # First byte is message count, skip it
             vin_bytes = data[1:18] if len(data) > 17 else data[:17]
             vin = ''.join(chr(b) for b in vin_bytes if 32 <= b <= 126)
+            logger.info(f"VIN extracted: {vin} (len={len(vin)})")
             return vin if len(vin) == 17 else None
         
         return None
