@@ -166,11 +166,16 @@ class SerialConnection(ELM327Connection):
                     )
                     self._connected = True
                     
-                    # Wake up and test with ATI (identity)
-                    await self._wake_up()
+                    # Quick poke: send CR and wait briefly for any response
+                    self._writer.write(b"\r\n")
+                    await self._writer.drain()
+                    try:
+                        await asyncio.wait_for(self._reader.read(1024), timeout=1.5)
+                    except asyncio.TimeoutError:
+                        pass
                     
                     # Quick test: send ATI and see if we get a real response
-                    response = await self.send_command("ATI", timeout=3.0)
+                    response = await self.send_command("ATI", timeout=2.0)
                     if response and "ELM" in response.upper():
                         logger.info(f"ELM327 detected at {baudrate} baud: {response}")
                         self.config.baudrate = baudrate
@@ -179,7 +184,6 @@ class SerialConnection(ELM327Connection):
                         return True
                     elif response:
                         logger.info(f"Got response at {baudrate} but not ELM327: {response[:50]}")
-                        # Still might work - try initializing
                         self.config.baudrate = baudrate
                         await self._initialize()
                         logger.info(f"Connected to ELM327 via serial: {self.config.address} @ {baudrate}")
