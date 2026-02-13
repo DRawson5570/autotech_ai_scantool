@@ -482,8 +482,7 @@ async def read_dtcs(user_id: str = "default"):
         for dtc in all_dtcs.get('stored', []):
             result["stored"].append({
                 "code": dtc.code,
-                "description": dtc.description,
-                "severity": dtc.severity
+                "description": dtc.description
             })
             session.add_dtc(dtc.code, dtc.description)
         
