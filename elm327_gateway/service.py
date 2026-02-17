@@ -240,9 +240,11 @@ class ELM327Service:
         self._ensure_connected()
         dtcs = await self._protocol.read_dtcs()
         
-        # Add descriptions
+        # Add descriptions, preserving ECU source tag from parser
         for dtc in dtcs:
-            dtc.description = get_dtc_description(dtc.code)
+            ecu_tag = dtc.description if dtc.description.startswith('[') else ''
+            desc = get_dtc_description(dtc.code)
+            dtc.description = f"{desc} {ecu_tag}".strip()
         
         logger.info(f"Read {len(dtcs)} stored DTCs")
         return dtcs
@@ -258,7 +260,9 @@ class ELM327Service:
         dtcs = await self._protocol.read_pending_dtcs()
         
         for dtc in dtcs:
-            dtc.description = get_dtc_description(dtc.code)
+            ecu_tag = dtc.description if dtc.description.startswith('[') else ''
+            desc = get_dtc_description(dtc.code)
+            dtc.description = f"{desc} {ecu_tag}".strip()
         
         logger.info(f"Read {len(dtcs)} pending DTCs")
         return dtcs
@@ -274,7 +278,9 @@ class ELM327Service:
         dtcs = await self._protocol.read_permanent_dtcs()
         
         for dtc in dtcs:
-            dtc.description = get_dtc_description(dtc.code)
+            ecu_tag = dtc.description if dtc.description.startswith('[') else ''
+            desc = get_dtc_description(dtc.code)
+            dtc.description = f"{desc} {ecu_tag}".strip()
         
         logger.info(f"Read {len(dtcs)} permanent DTCs")
         return dtcs

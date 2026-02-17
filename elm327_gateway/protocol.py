@@ -202,13 +202,15 @@ class OBDProtocol:
     
     async def read_dtcs(self) -> List[DTC]:
         """
-        Read stored DTCs.
+        Read stored DTCs from ALL ECUs (PCM, BCM, TCM, etc.).
+        
+        Temporarily enables CAN headers to distinguish responses
+        from different modules on the bus.
         
         Returns:
             List of DTC objects
         """
-        response = await self.connection.send_command("03")
-        return self._parse_dtcs(response, status="stored")
+        return await self._read_dtcs_all_modules("03", "stored")
     
     # -------------------------------------------------------------------------
     # Mode 04: Clear DTCs
@@ -231,13 +233,12 @@ class OBDProtocol:
     
     async def read_pending_dtcs(self) -> List[DTC]:
         """
-        Read pending DTCs (current drive cycle).
+        Read pending DTCs (current drive cycle) from ALL ECUs.
         
         Returns:
             List of DTC objects
         """
-        response = await self.connection.send_command("07")
-        return self._parse_dtcs(response, status="pending")
+        return await self._read_dtcs_all_modules("07", "pending")
     
     # -------------------------------------------------------------------------
     # Mode 08: Control Operations (Actuator Tests)
@@ -312,13 +313,44 @@ class OBDProtocol:
     
     async def read_permanent_dtcs(self) -> List[DTC]:
         """
-        Read permanent DTCs (survive clear).
+        Read permanent DTCs (survive clear) from ALL ECUs.
         
         Returns:
             List of DTC objects
         """
-        response = await self.connection.send_command("0A")
-        return self._parse_dtcs(response, status="permanent")
+        return await self._read_dtcs_all_modules("0A", "permanent")
+    
+    async def _read_dtcs_all_modules(self, mode: str, status: str) -> List[DTC]:
+        """
+        Read DTCs with CAN headers enabled to capture responses from all ECUs.
+        
+        On CAN bus, broadcasting mode 03/07/0A to 7DF gets responses from
+        every ECU (PCM=7E8, TCM=7E9, BCM=7EA, etc.). We temporarily enable
+        headers to distinguish which module reported each DTC.
+        
+        Args:
+            mode: OBD mode as hex string ("03", "07", "0A")
+            status: DTC status label
+            
+        Returns:
+            List of DTC objects
+        """
+        try:
+            # Enable headers and spaces for reliable multi-ECU parsing
+            await self.connection.send_command("ATH1")
+            await self.connection.send_command("ATS1")
+            
+            response = await self.connection.send_command(mode)
+            logger.info(f"DTC mode {mode} raw response (headers on): {repr(response)}")
+            
+            return self._parse_dtcs(response, status=status)
+        finally:
+            # Always restore original settings
+            try:
+                await self.connection.send_command("ATH0")
+                await self.connection.send_command("ATS0")
+            except Exception as e:
+                logger.warning(f"Failed to restore AT settings: {e}")
     
     # -------------------------------------------------------------------------
     # Helper Methods
@@ -409,8 +441,16 @@ class OBDProtocol:
         """
         Parse DTC response into DTC objects.
         
+        Handles two response formats:
+        1. With CAN headers (ATH1): "7E8 06 43 01 01 71 00 00"
+           - 7E8 = PCM, 7E9 = TCM, 7EA = ABS, 7EB = BCM, etc.
+        2. Without headers (ATH0): "43 01 71 00 00"
+        
+        Also detects phantom DTCs caused by adapters echoing the
+        response header as padding bytes.
+        
         Args:
-            response: Raw DTC response
+            response: Raw DTC response (may have CAN headers)
             status: DTC status (stored, pending, permanent)
             
         Returns:
@@ -418,28 +458,84 @@ class OBDProtocol:
         """
         dtcs = []
         
-        # Clean response
-        cleaned = ''.join(response.split())
+        if not response or "NO DATA" in response.upper() or "ERROR" in response.upper():
+            return dtcs
         
-        # Remove response header (43 for mode 03, 47 for mode 07, 4A for mode 0A)
-        if cleaned.startswith('43') or cleaned.startswith('47') or cleaned.startswith('4A'):
-            cleaned = cleaned[2:]
+        # Determine expected response header for the OBD mode
+        header_map = {"stored": "43", "pending": "47", "permanent": "4A"}
+        expected_header = header_map.get(status, "43").upper()
         
-        # Each DTC is 4 hex characters (2 bytes)
-        # Format: First nibble = type + first digit, remaining = rest of code
-        # 0xxx = P0xxx, 4xxx = C0xxx, 8xxx = B0xxx, Cxxx = U0xxx
+        # CAN ECU address names for logging
+        ecu_names = {
+            "7E8": "PCM", "7E9": "TCM", "7EA": "ABS",
+            "7EB": "BCM", "7EC": "SRS", "7ED": "HVAC",
+        }
         
-        for i in range(0, len(cleaned) - 3, 4):
-            try:
-                dtc_hex = cleaned[i:i+4]
-                if dtc_hex == '0000':
-                    continue  # No DTC
-                
-                dtc_code = self._decode_dtc(dtc_hex)
-                if dtc_code:
-                    dtcs.append(DTC(code=dtc_code, status=status))
-            except Exception as e:
-                logger.debug(f"Error parsing DTC at position {i}: {e}")
+        lines = [l.strip() for l in response.split('\n') if l.strip()]
+        
+        for line in lines:
+            # Check if line has CAN header (3-char hex addr like 7E8)
+            parts = line.split()
+            ecu_addr = None
+            data_str = line
+            
+            if parts and len(parts[0]) == 3:
+                try:
+                    int(parts[0], 16)
+                    ecu_addr = parts[0].upper()
+                    ecu_name = ecu_names.get(ecu_addr, f"ECU-{ecu_addr}")
+                    # Data after address; skip length byte if CAN (2nd byte)
+                    data_str = ' '.join(parts[1:])
+                    logger.debug(f"DTC response from {ecu_name} ({ecu_addr}): {data_str}")
+                except ValueError:
+                    pass  # Not a CAN header
+            
+            # Remove spaces and normalize
+            cleaned = ''.join(data_str.split()).upper()
+            
+            # For CAN frames, skip the length byte (first byte after address)
+            # CAN: 7E8 06 43 01 01 71 00 00 → cleaned="064301017100 00"
+            if ecu_addr and len(cleaned) >= 2:
+                try:
+                    frame_len = int(cleaned[:2], 16)
+                    if 1 <= frame_len <= 7:  # Valid CAN single-frame length
+                        cleaned = cleaned[2:]  # Remove length byte
+                except ValueError:
+                    pass
+            
+            # Strip the OBD response header (43/47/4A)
+            if cleaned.startswith(expected_header):
+                cleaned = cleaned[2:]
+            else:
+                continue  # Not a DTC response line
+            
+            # Now `cleaned` should be pairs of DTC bytes: "0171 0000" etc.
+            # Each DTC is 4 hex characters (2 bytes)
+            for i in range(0, len(cleaned) - 3, 4):
+                try:
+                    dtc_hex = cleaned[i:i+4]
+                    if dtc_hex == '0000':
+                        continue  # No DTC (padding)
+                    
+                    # Detect phantom DTC: adapter echoes response header as padding
+                    if dtc_hex == f"00{expected_header}":
+                        logger.warning(
+                            f"Skipping phantom DTC 00{expected_header} "
+                            f"(response header echo artifact from adapter)"
+                        )
+                        continue
+                    
+                    dtc_code = self._decode_dtc(dtc_hex)
+                    if dtc_code:
+                        # Include source ECU in description if known
+                        dtc_obj = DTC(code=dtc_code, status=status)
+                        if ecu_addr:
+                            ecu_name = ecu_names.get(ecu_addr, ecu_addr)
+                            dtc_obj.description = f"[{ecu_name}]"
+                        dtcs.append(dtc_obj)
+                        logger.info(f"Parsed DTC: {dtc_code} from {ecu_addr or 'unknown ECU'}")
+                except Exception as e:
+                    logger.debug(f"Error parsing DTC at position {i}: {e}")
         
         return dtcs
     
