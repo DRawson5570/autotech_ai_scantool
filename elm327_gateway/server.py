@@ -149,6 +149,11 @@ class ActuatorRequest(BaseModel):
     state: str = "on"  # on, off, default
     duration: float = 5.0  # Auto-release after seconds
 
+class ReadDIDRequest(BaseModel):
+    module_addr: str  # Hex string like "0x760" or "760" or decimal
+    dids: str  # Comma-separated hex DIDs: "F190, F187, 4001"
+    bus: str = "HS-CAN"  # "HS-CAN" or "MS-CAN"
+
 
 # =============================================================================
 # FastAPI App
@@ -587,6 +592,39 @@ async def scan_modules():
             "timestamp": datetime.now().isoformat()
         }
         
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/read-did")
+async def read_did(req: ReadDIDRequest):
+    """Read UDS DIDs from a specific ECU module."""
+    _require_connection()
+    
+    try:
+        # Parse module address (hex string like "0x760" or "760")
+        addr_str = req.module_addr.strip().lower().replace("0x", "")
+        module_addr = int(addr_str, 16)
+        
+        # Parse DIDs (comma-separated hex: "F190, F187, 4001")
+        did_strs = [d.strip().lower().replace("0x", "") for d in req.dids.split(",")]
+        dids = [int(d, 16) for d in did_strs if d]
+        
+        if not dids:
+            raise HTTPException(status_code=400, detail="No valid DIDs provided")
+        
+        results = await _elm.read_dids(module_addr, dids, bus=req.bus)
+        
+        return {
+            "module_addr": f"0x{module_addr:03X}",
+            "bus": req.bus,
+            "dids": results,
+            "did_count": len(results),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid address or DID format: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

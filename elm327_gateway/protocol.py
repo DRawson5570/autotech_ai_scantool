@@ -898,6 +898,246 @@ class OBDProtocol:
         
         return info
 
+    async def read_did(
+        self,
+        module_addr: int,
+        did: int,
+        bus: str = "HS-CAN",
+    ) -> Optional[str]:
+        """
+        Read a single UDS DID from a specific module.
+        
+        Handles bus switching (MS-CAN ↔ HS-CAN) automatically.
+        
+        Args:
+            module_addr: CAN request address (e.g. 0x760 for GEM)
+            did: UDS DID number (e.g. 0xF190 for VIN, or 0x4001)
+            bus: "HS-CAN" or "MS-CAN"
+            
+        Returns:
+            DID value as string (ASCII if printable, hex otherwise), or None
+        """
+        switched_bus = False
+        try:
+            # Switch to MS-CAN if needed
+            if bus.upper() == "MS-CAN":
+                logger.info(f"Switching to MS-CAN for DID read...")
+                # Try STP33 first (proven on OBDLink MX+/STN2255)
+                resp = await self.connection.send_command("STP33")
+                if resp and "?" not in resp:
+                    switched_bus = True
+                    logger.info(f"  MS-CAN via STP33: OK")
+                else:
+                    # Fallback to ELM327 Protocol B
+                    for cmd in ["ATPB C004", "ATSP B"]:
+                        await self.connection.send_command(cmd)
+                    switched_bus = True
+                    logger.info(f"  MS-CAN via ATPB/ATSP B: OK")
+            
+            # Compute response address for CAN filter
+            # Standard: req + 8 (e.g. 0x7E0 → 0x7E8)
+            # Ford MS-CAN: varies, check FORD_MS_CAN_ADDRESSES
+            resp_addr = None
+            for ra, info in FORD_MS_CAN_ADDRESSES.items():
+                if info["request"] == module_addr:
+                    resp_addr = ra
+                    break
+            if resp_addr is None:
+                for ra, info in ECU_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
+                resp_addr = module_addr + 8  # Default offset
+            
+            # Set up CAN filtering
+            await self.connection.send_command("ATH1")
+            await self.connection.send_command(f"ATSH{module_addr:03X}")
+            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+            
+            # UDS Service 0x22: ReadDataByIdentifier
+            cmd = f"22{did:04X}"
+            resp = await self.connection.send_command(cmd, timeout=5.0)
+            
+            if not resp or not self._is_live_response(resp):
+                logger.info(f"  DID {did:04X} from {module_addr:03X}: no response")
+                return None
+            
+            # Parse positive response: 62 XX XX <data>
+            cleaned = resp.replace(' ', '').upper()
+            did_hex = f"{did:04X}"
+            marker = f"62{did_hex}"
+            idx = cleaned.find(marker)
+            
+            if idx < 0:
+                # Check for negative response (7F 22 xx)
+                if "7F22" in cleaned:
+                    nrc_idx = cleaned.find("7F22") + 4
+                    nrc = cleaned[nrc_idx:nrc_idx+2] if nrc_idx + 2 <= len(cleaned) else "??"
+                    nrc_names = {
+                        "12": "subFunctionNotSupported",
+                        "13": "incorrectMessageLength",
+                        "14": "responseTooLong",
+                        "22": "conditionsNotCorrect",
+                        "31": "requestOutOfRange",
+                        "33": "securityAccessDenied",
+                        "72": "generalProgrammingFailure",
+                    }
+                    nrc_name = nrc_names.get(nrc, f"NRC 0x{nrc}")
+                    logger.info(f"  DID {did_hex}: negative response ({nrc_name})")
+                    return None
+                logger.info(f"  DID {did_hex}: unexpected response: {resp}")
+                return None
+            
+            # Data starts after 62+DID (6 hex chars)
+            data_hex = cleaned[idx + len(marker):]
+            if not data_hex:
+                return None
+            
+            # Decode: try ASCII first, fall back to hex
+            try:
+                data_bytes = bytes.fromhex(data_hex)
+                text = ''.join(
+                    chr(b) if 32 <= b < 127 else '' 
+                    for b in data_bytes
+                ).strip()
+                result = text if text else data_hex
+            except ValueError:
+                result = data_hex
+            
+            logger.info(f"  DID {did_hex} from {module_addr:03X}: {result}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"read_did({module_addr:03X}, {did:04X}) failed: {e}")
+            return None
+        finally:
+            # Restore bus and headers
+            if switched_bus:
+                for cmd in ["STP6", "STPC1"]:
+                    try:
+                        await self.connection.send_command(cmd)
+                    except Exception:
+                        pass
+                try:
+                    await self.connection.send_command("ATSP6")
+                except Exception:
+                    pass
+            try:
+                await self.connection.send_command("ATSH7DF")
+                await self.connection.send_command("ATCRA")
+                await self.connection.send_command("ATH0")
+            except Exception:
+                pass
+
+    async def read_dids(
+        self,
+        module_addr: int,
+        dids: List[int],
+        bus: str = "HS-CAN",
+    ) -> Dict[str, str]:
+        """
+        Read multiple UDS DIDs from a specific module (single bus switch).
+        
+        Args:
+            module_addr: CAN request address
+            dids: List of DID numbers to read
+            bus: "HS-CAN" or "MS-CAN"
+            
+        Returns:
+            Dict mapping "DID_XXXX" or known label to value string
+        """
+        results = {}
+        switched_bus = False
+        try:
+            # Switch to MS-CAN if needed
+            if bus.upper() == "MS-CAN":
+                resp = await self.connection.send_command("STP33")
+                if resp and "?" not in resp:
+                    switched_bus = True
+                else:
+                    for cmd in ["ATPB C004", "ATSP B"]:
+                        await self.connection.send_command(cmd)
+                    switched_bus = True
+            
+            # Compute response address
+            resp_addr = None
+            for ra, info in FORD_MS_CAN_ADDRESSES.items():
+                if info["request"] == module_addr:
+                    resp_addr = ra
+                    break
+            if resp_addr is None:
+                for ra, info in ECU_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
+                resp_addr = module_addr + 8
+            
+            await self.connection.send_command("ATH1")
+            await self.connection.send_command(f"ATSH{module_addr:03X}")
+            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+            
+            for did in dids:
+                try:
+                    cmd = f"22{did:04X}"
+                    resp = await self.connection.send_command(cmd, timeout=5.0)
+                    
+                    if not resp or not self._is_live_response(resp):
+                        continue
+                    
+                    cleaned = resp.replace(' ', '').upper()
+                    did_hex = f"{did:04X}"
+                    marker = f"62{did_hex}"
+                    idx = cleaned.find(marker)
+                    
+                    if idx < 0:
+                        continue
+                    
+                    data_hex = cleaned[idx + len(marker):]
+                    if not data_hex:
+                        continue
+                    
+                    try:
+                        data_bytes = bytes.fromhex(data_hex)
+                        text = ''.join(
+                            chr(b) if 32 <= b < 127 else '' 
+                            for b in data_bytes
+                        ).strip()
+                        value = text if text else data_hex
+                    except ValueError:
+                        value = data_hex
+                    
+                    # Use known label or DID hex
+                    label = STANDARD_DIDS.get(did, f"DID_{did_hex}")
+                    results[label] = value
+                    logger.info(f"  DID {did_hex}: {value}")
+                    
+                except Exception as e:
+                    logger.debug(f"  DID {did:04X} failed: {e}")
+            
+        except Exception as e:
+            logger.error(f"read_dids({module_addr:03X}) failed: {e}")
+        finally:
+            if switched_bus:
+                for cmd in ["STP6", "STPC1"]:
+                    try:
+                        await self.connection.send_command(cmd)
+                    except Exception:
+                        pass
+                try:
+                    await self.connection.send_command("ATSP6")
+                except Exception:
+                    pass
+            try:
+                await self.connection.send_command("ATSH7DF")
+                await self.connection.send_command("ATCRA")
+                await self.connection.send_command("ATH0")
+            except Exception:
+                pass
+        
+        return results
+
     async def get_module_supported_pids(self, request_addr: int) -> List[int]:
         """
         Enumerate all supported Mode 01 PIDs for a specific ECU module.

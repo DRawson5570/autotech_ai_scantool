@@ -240,6 +240,36 @@ class ELM327Service:
         self._ensure_connected()
         return await self._protocol.scan_all_modules(vin=self._vin)
     
+    async def read_did(self, module_addr: int, did: int, bus: str = "HS-CAN") -> Optional[str]:
+        """
+        Read a single UDS DID from a specific module.
+        
+        Args:
+            module_addr: CAN request address (e.g. 0x760 for GEM)
+            did: DID number (e.g. 0xF190 for VIN)
+            bus: "HS-CAN" or "MS-CAN"
+            
+        Returns:
+            DID value as string, or None
+        """
+        self._ensure_connected()
+        return await self._protocol.read_did(module_addr, did, bus=bus)
+    
+    async def read_dids(self, module_addr: int, dids: list, bus: str = "HS-CAN") -> dict:
+        """
+        Read multiple UDS DIDs from a specific module.
+        
+        Args:
+            module_addr: CAN request address
+            dids: List of DID numbers
+            bus: "HS-CAN" or "MS-CAN"
+            
+        Returns:
+            Dict mapping DID label to value string
+        """
+        self._ensure_connected()
+        return await self._protocol.read_dids(module_addr, dids, bus=bus)
+    
     # -------------------------------------------------------------------------
     # DTC Operations
     # -------------------------------------------------------------------------
