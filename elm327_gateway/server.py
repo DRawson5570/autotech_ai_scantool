@@ -509,6 +509,46 @@ async def read_dtcs(user_id: str = "default"):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/supported_pids")
+async def get_supported_pids_list():
+    """Return the list of PIDs supported by the connected vehicle."""
+    _require_connection()
+    
+    try:
+        supported = await _elm.get_supported_pids()
+        
+        # Resolve PID numbers to names
+        from elm327_gateway.pids import PIDRegistry
+        pid_names = []
+        for pid_num in sorted(supported):
+            defn = PIDRegistry.get(pid_num)
+            if defn:
+                pid_names.append({
+                    "pid": pid_num,
+                    "name": defn.name,
+                    "description": defn.description,
+                    "unit": defn.unit,
+                    "category": defn.category.value if defn.category else "unknown"
+                })
+            else:
+                pid_names.append({
+                    "pid": pid_num,
+                    "name": f"PID_0x{pid_num:02X}",
+                    "description": f"Unknown PID 0x{pid_num:02X}",
+                    "unit": "",
+                    "category": "unknown"
+                })
+        
+        return {
+            "supported_pids": pid_names,
+            "count": len(pid_names),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/pids")
 async def read_pids(req: PIDRequest, user_id: str = "default"):
     """Read specific PIDs."""
