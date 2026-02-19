@@ -491,13 +491,33 @@ class OBDProtocol:
             # --- Phase 3: Probe MS-CAN (125 kbps) for body/comfort modules ---
             # Ford (and some other makes) put non-emission modules on a second,
             # slower CAN bus accessible via OBD-II pins 3+11.
-            # ELM327 can switch to this bus using Protocol B (user-defined CAN).
-            logger.info("Phase 3: Switching to MS-CAN (125 kbps) for body/comfort modules...")
+            # OBDLink MX+ (STN chip) requires STCANSW 1 to switch physical transceiver.
+            # Generic ELM327 clones typically can't do this (single transceiver).
+            logger.info("Phase 3: Switching to MS-CAN (125 kbps, pins 3+11)...")
             
             ms_can_ok = False
+            stn_device = False
             try:
-                # Save current protocol for restore
-                # Configure Protocol B: 11-bit CAN, ISO 15765-4 framing, 125 kbps
+                # --- Step 1: Switch physical CAN transceiver (STN/OBDLink devices) ---
+                # STCANSW 1 = use secondary CAN transceiver (pins 3+11)
+                # This is STN-specific; real ELM327 will return '?'
+                sw_resp = await self.connection.send_command("STCANSW1")
+                logger.info(f"  STCANSW 1 -> {repr(sw_resp)}")
+                
+                if sw_resp and "?" not in sw_resp:
+                    stn_device = True
+                    logger.info("  STN/OBDLink device detected — CAN switched to pins 3+11")
+                else:
+                    # Try with space
+                    sw_resp2 = await self.connection.send_command("STCANSW 1")
+                    logger.info(f"  STCANSW 1 (spaced) -> {repr(sw_resp2)}")
+                    if sw_resp2 and "?" not in sw_resp2:
+                        stn_device = True
+                        logger.info("  STN/OBDLink device detected — CAN switched to pins 3+11")
+                    else:
+                        logger.info("  Not an STN device (no STCANSW support)")
+                
+                # --- Step 2: Configure Protocol B for 125 kbps ---
                 # AT PB xx yy: xx=C0 (11-bit + ISO framing), yy=04 (500/4=125 kbps)
                 pb_resp = await self.connection.send_command("ATPBC004")
                 logger.info(f"  ATPB C0 04 -> {repr(pb_resp)}")
@@ -510,12 +530,19 @@ class OBDProtocol:
                     if sp_resp and "?" not in sp_resp:
                         ms_can_ok = True
                     else:
-                        logger.info("  ELM327 does not support Protocol B")
+                        logger.info("  Protocol B not accepted")
                 else:
-                    logger.info("  ELM327 does not support ATPB command")
+                    logger.info("  ATPB not supported")
+                
+                if not ms_can_ok and stn_device:
+                    # OBDLink alternative: use STP 53 (Ford MS-CAN built-in protocol)
+                    stp_resp = await self.connection.send_command("STP53")
+                    logger.info(f"  STP 53 (Ford MS-CAN) -> {repr(stp_resp)}")
+                    if stp_resp and "?" not in stp_resp:
+                        ms_can_ok = True
                 
                 if not ms_can_ok:
-                    # Try alternative baud divisor (some clones use different formula)
+                    # Try alternative baud divisor
                     pb_resp2 = await self.connection.send_command("ATPBC009")
                     logger.info(f"  ATPB C0 09 (alt) -> {repr(pb_resp2)}")
                     if pb_resp2 and "?" not in pb_resp2:
@@ -598,6 +625,14 @@ class OBDProtocol:
         finally:
             # Restore to HS-CAN (Protocol 6) and default settings
             try:
+                # Switch CAN transceiver back to primary (pins 6+14) if STN device
+                try:
+                    await self.connection.send_command("STCANSW0")
+                except Exception:
+                    try:
+                        await self.connection.send_command("STCANSW 0")
+                    except Exception:
+                        pass
                 await self.connection.send_command("ATSP6")   # Back to ISO 15765-4 CAN 500k
                 await self.connection.send_command("ATSH7DF")  # Reset to broadcast
                 await self.connection.send_command("ATH0")
