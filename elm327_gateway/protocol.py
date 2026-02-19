@@ -124,6 +124,83 @@ STANDARD_DIDS = {
     0xF1A0: "Supplier ID",
 }
 
+# VIN WMI (chars 1-3) to secondary bus mapping
+# Determines which vehicles have MS-CAN or other secondary buses
+MANUFACTURER_BUS_CONFIG = {
+    # Ford Motor Company — MS-CAN on pins 3+11 at 125 kbps
+    "ford": {"bus": "MS-CAN", "addresses": "FORD_MS_CAN_ADDRESSES"},
+}
+
+# WMI prefix → manufacturer key (Ford has many WMIs)
+WMI_TO_MANUFACTURER = {
+    # Ford USA
+    "1FA": "ford", "1FB": "ford", "1FC": "ford", "1FD": "ford",
+    "1FM": "ford", "1FT": "ford", "1FV": "ford",
+    # Ford Canada
+    "2FA": "ford", "2FB": "ford", "2FC": "ford", "2FD": "ford",
+    "2FM": "ford", "2FT": "ford",
+    # Ford Mexico
+    "3FA": "ford", "3FB": "ford", "3FC": "ford", "3FD": "ford",
+    "3FM": "ford", "3FT": "ford",
+    # Ford Turkey (Transit)
+    "NM0": "ford",
+    # Ford Europe
+    "WF0": "ford", "WFD": "ford",
+    # Ford Australia
+    "6FP": "ford",
+    # Lincoln
+    "1LN": "ford", "2LN": "ford", "3LN": "ford",
+    "5LM": "ford",
+    # Mercury (discontinued but still on road)
+    "1ME": "ford", "2ME": "ford", "4M2": "ford",
+    # Ford trucks
+    "1FT": "ford", "3FT": "ford",
+    # --- Future: GM (GMLAN on pin 1, 33.3 kbps) ---
+    # "1G1": "gm", "1G2": "gm", "1GC": "gm", "1GK": "gm",
+    # "2G1": "gm", "2G2": "gm", "3G1": "gm", "3GK": "gm",
+    # --- Future: Stellantis (CAN-IHS on pins 3+11) ---
+    # "1C3": "stellantis", "1C4": "stellantis", "1C6": "stellantis",
+    # "2C3": "stellantis", "2C4": "stellantis", "3C4": "stellantis",
+    # "3D7": "stellantis",
+}
+
+
+def get_vehicle_bus_config(vin: str) -> dict:
+    """
+    Determine secondary bus configuration from VIN.
+    
+    Args:
+        vin: 17-character VIN
+        
+    Returns:
+        Dict with 'manufacturer', 'has_ms_can', 'bus_type' or empty dict if unknown
+    """
+    if not vin or len(vin) < 3:
+        return {}
+    
+    wmi = vin[:3].upper()
+    mfr = WMI_TO_MANUFACTURER.get(wmi)
+    
+    if not mfr:
+        # Try first 2 chars (some WMI tables use 2-char prefix)
+        for prefix_len in [2]:
+            for key, val in WMI_TO_MANUFACTURER.items():
+                if key[:prefix_len] == wmi[:prefix_len] and len(key) >= prefix_len:
+                    mfr = val
+                    break
+            if mfr:
+                break
+    
+    if mfr and mfr in MANUFACTURER_BUS_CONFIG:
+        config = MANUFACTURER_BUS_CONFIG[mfr]
+        return {
+            "manufacturer": mfr,
+            "has_ms_can": True,
+            "bus_type": config["bus"],
+        }
+    
+    return {"manufacturer": mfr or "unknown", "has_ms_can": False}
+
 
 @dataclass
 class ECUModule:
@@ -387,7 +464,7 @@ class OBDProtocol:
     # Module Discovery & Per-Module PID Enumeration
     # -------------------------------------------------------------------------
     
-    async def discover_modules(self) -> List[ECUModule]:
+    async def discover_modules(self, vin: str = None) -> List[ECUModule]:
         """
         Discover all ECU modules on the CAN bus by probing each of the
         8 standard OBD-II addresses individually.
@@ -397,6 +474,11 @@ class OBDProtocol:
            — works for ABS, SRS, BCM, HVAC, etc. that don't support Mode 01
         2. Also try Mode 01 PID 00 (0100) for OBD-II emission modules
         3. Any address that responds to either is a live module
+        4. If VIN indicates Ford/Lincoln/Mercury, probe MS-CAN (Phase 3)
+           Otherwise skip Phase 3 entirely (~60s saved)
+        
+        Args:
+            vin: Optional 17-char VIN for manufacturer-aware bus detection
         
         Returns:
             List of ECUModule objects for each responding module
@@ -502,160 +584,173 @@ class OBDProtocol:
                 pass
             
             # --- Phase 3: Probe MS-CAN (125 kbps) for body/comfort modules ---
-            # Ford (and some other makes) put non-emission modules on a second,
-            # slower CAN bus accessible via OBD-II pins 3+11.
-            # OBDLink MX+ (STN2255) needs CAN channel 2 selection via STPBR/STPC
-            # or ATPB with channel bit set (bit 5 of config byte).
-            logger.info("Phase 3: Switching to MS-CAN (125 kbps, pins 3+11)...")
+            # Only run if VIN indicates a manufacturer that uses MS-CAN,
+            # or if no VIN is available (probe anyway to be safe).
+            bus_config = get_vehicle_bus_config(vin) if vin else {}
+            skip_ms_can = False
             
-            ms_can_ok = False
-            stn_device = False
-            try:
-                # --- Step 0: Identify the device ---
-                ati_resp = await self.connection.send_command("ATI")
-                logger.info(f"  ATI (device ID) -> {repr(ati_resp)}")
-                
-                sti_resp = await self.connection.send_command("STI")
-                logger.info(f"  STI (STN device ID) -> {repr(sti_resp)}")
-                
-                stdi_resp = await self.connection.send_command("STDI")
-                logger.info(f"  STDI (STN description) -> {repr(stdi_resp)}")
-                
-                # Check if this is an STN device
-                if sti_resp and "?" not in sti_resp and "STN" in sti_resp.upper():
-                    stn_device = True
-                    logger.info(f"  Confirmed STN device: {sti_resp}")
-                
-                # --- Step 1: Try STN-specific MS-CAN switching methods ---
-                if stn_device:
-                    # STP33 is the proven working command on STN2255 (OBDLink MX+)
-                    # It selects Ford MS-CAN (125 kbps, pins 3+11) directly
-                    stn_methods = [
-                        ("STP33", "STN Ford MS-CAN protocol"),
-                        ("STPC2", "STN CAN channel 2"),
-                        ("STCANSW 1", "STN CAN switch"),
-                        ("STCSWM 2", "STN CAN switch mode"),
-                        ("STPBR 125000", "STN baud rate 125k"),
-                    ]
-                    for cmd, desc in stn_methods:
-                        resp = await self.connection.send_command(cmd)
-                        logger.info(f"  {cmd} -> {repr(resp)}")
-                        if resp and "?" not in resp:
-                            ms_can_ok = True
-                            logger.info(f"  MS-CAN via {desc}: {cmd}")
-                            break
-                
-                # --- Step 2: Configure Protocol B for 125 kbps ---
-                if not ms_can_ok:
-                    # ATPB E0 04: E0 = ISO 15765-4 + 11-bit + CAN channel 2 (bit 5)
-                    # This tells STN devices to use the secondary CAN transceiver
-                    pb_resp = await self.connection.send_command("ATPBE004")
-                    logger.info(f"  ATPB E0 04 (channel 2) -> {repr(pb_resp)}")
-                    
-                    if pb_resp and "?" not in pb_resp:
-                        sp_resp = await self.connection.send_command("ATSPB")
-                        logger.info(f"  AT SP B -> {repr(sp_resp)}")
-                        if sp_resp and "?" not in sp_resp:
-                            ms_can_ok = True
-                            logger.info("  MS-CAN via ATPB E004 (channel 2)")
-                    
-                    # Fallback: C0 04 (channel 1 — won't work for MS-CAN on STN but
-                    # might work on some generic adapters with pin 3+11 wired)
-                    if not ms_can_ok:
-                        pb_resp2 = await self.connection.send_command("ATPBC004")
-                        logger.info(f"  ATPB C0 04 (channel 1 fallback) -> {repr(pb_resp2)}")
-                        if pb_resp2 and "?" not in pb_resp2:
-                            sp_resp2 = await self.connection.send_command("ATSPB")
-                            logger.info(f"  AT SP B -> {repr(sp_resp2)}")
-                            if sp_resp2 and "?" not in sp_resp2:
-                                ms_can_ok = True
-                                logger.info("  MS-CAN via ATPB C004 (channel 1 fallback)")
-                
-                if ms_can_ok:
-                    # Enable headers for address identification
-                    await self.connection.send_command("ATH1")
-                    await self.connection.send_command("ATS1")
-                    
-                    # Set extended timeout for MS-CAN (slower bus)
-                    try:
-                        await self.connection.send_command("ATSTFF")
-                    except Exception:
-                        pass
-                    
-                    ms_can_found = 0
-                    for resp_addr, info in FORD_MS_CAN_ADDRESSES.items():
-                        req_addr = info["request"]
-                        
-                        try:
-                            # Target this address
-                            await self.connection.send_command(f"ATSH{req_addr:03X}")
-                            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
-                            
-                            # Try TesterPresent
-                            tp_resp = await self.connection.send_command("3E00", timeout=3.0)
-                            logger.info(f"  MS-CAN {req_addr:03X} TesterPresent -> {repr(tp_resp)}")
-                            
-                            if self._is_live_response(tp_resp):
-                                module = ECUModule(
-                                    response_addr=resp_addr,
-                                    request_addr=req_addr,
-                                    name=info["name"],
-                                    description=info["description"],
-                                    bus="MS-CAN",
-                                )
-                                modules.append(module)
-                                ms_can_found += 1
-                                logger.info(f"  >>> MS-CAN Discovered: {info['name']} ({resp_addr:03X})")
-                                continue
-                            
-                            # Try DiagnosticSessionControl
-                            dsc_resp = await self.connection.send_command("1001", timeout=3.0)
-                            logger.info(f"  MS-CAN {req_addr:03X} DiagSessionCtrl -> {repr(dsc_resp)}")
-                            
-                            if self._is_live_response(dsc_resp):
-                                module = ECUModule(
-                                    response_addr=resp_addr,
-                                    request_addr=req_addr,
-                                    name=info["name"],
-                                    description=info["description"],
-                                    bus="MS-CAN",
-                                )
-                                modules.append(module)
-                                ms_can_found += 1
-                                logger.info(f"  >>> MS-CAN Discovered: {info['name']} ({resp_addr:03X})")
-                            
-                        except Exception as e:
-                            logger.debug(f"  MS-CAN {req_addr:03X}: exception: {e}")
-                    
-                    logger.info(f"Phase 3 complete: found {ms_can_found} MS-CAN module(s)")
-                    
-                    # Read UDS DIDs for each discovered MS-CAN module
-                    # (must do this while still on MS-CAN bus)
-                    for mod in modules:
-                        if mod.bus != "MS-CAN":
-                            continue
-                        try:
-                            logger.info(f"  Reading DIDs for {mod.name} ({mod.request_addr:03X})...")
-                            await self.connection.send_command(f"ATSH{mod.request_addr:03X}")
-                            await self.connection.send_command(f"ATCRA{mod.response_addr:03X}")
-                            mod.module_info = await self._read_module_dids(mod)
-                            if mod.module_info:
-                                logger.info(f"  {mod.name}: {len(mod.module_info)} DID(s) read")
-                            else:
-                                logger.info(f"  {mod.name}: no DIDs readable")
-                        except Exception as e:
-                            logger.debug(f"  {mod.name} DID read failed: {e}")
-                    
-                    # Reset CAN receive filter
-                    try:
-                        await self.connection.send_command("ATCRA")
-                    except Exception:
-                        pass
+            if bus_config:
+                mfr = bus_config.get('manufacturer', 'unknown')
+                has_ms_can = bus_config.get('has_ms_can', False)
+                if has_ms_can:
+                    logger.info(f"Phase 3: VIN {vin[:3]} -> {mfr} (has MS-CAN, probing...)")
                 else:
-                    logger.info("Phase 3 skipped: ELM327 does not support user-defined CAN protocols")
+                    logger.info(f"Phase 3: VIN {vin[:3]} -> {mfr} (no MS-CAN, skipping Phase 3)")
+                    skip_ms_can = True
+            else:
+                logger.info("Phase 3: No VIN available, probing MS-CAN as fallback...")
+            
+            if not skip_ms_can:
+                logger.info("Switching to MS-CAN (125 kbps, pins 3+11)...")
+                
+                ms_can_ok = False
+                stn_device = False
+                try:
+                    # --- Step 0: Identify the device ---
+                    ati_resp = await self.connection.send_command("ATI")
+                    logger.info(f"  ATI (device ID) -> {repr(ati_resp)}")
+                
+                    sti_resp = await self.connection.send_command("STI")
+                    logger.info(f"  STI (STN device ID) -> {repr(sti_resp)}")
+                
+                    stdi_resp = await self.connection.send_command("STDI")
+                    logger.info(f"  STDI (STN description) -> {repr(stdi_resp)}")
+                
+                    # Check if this is an STN device
+                    if sti_resp and "?" not in sti_resp and "STN" in sti_resp.upper():
+                        stn_device = True
+                        logger.info(f"  Confirmed STN device: {sti_resp}")
+                
+                    # --- Step 1: Try STN-specific MS-CAN switching methods ---
+                    if stn_device:
+                        # STP33 is the proven working command on STN2255 (OBDLink MX+)
+                        # It selects Ford MS-CAN (125 kbps, pins 3+11) directly
+                        stn_methods = [
+                            ("STP33", "STN Ford MS-CAN protocol"),
+                            ("STPC2", "STN CAN channel 2"),
+                            ("STCANSW 1", "STN CAN switch"),
+                            ("STCSWM 2", "STN CAN switch mode"),
+                            ("STPBR 125000", "STN baud rate 125k"),
+                        ]
+                        for cmd, desc in stn_methods:
+                            resp = await self.connection.send_command(cmd)
+                            logger.info(f"  {cmd} -> {repr(resp)}")
+                            if resp and "?" not in resp:
+                                ms_can_ok = True
+                                logger.info(f"  MS-CAN via {desc}: {cmd}")
+                                break
+                
+                    # --- Step 2: Configure Protocol B for 125 kbps ---
+                    if not ms_can_ok:
+                        # ATPB E0 04: E0 = ISO 15765-4 + 11-bit + CAN channel 2 (bit 5)
+                        # This tells STN devices to use the secondary CAN transceiver
+                        pb_resp = await self.connection.send_command("ATPBE004")
+                        logger.info(f"  ATPB E0 04 (channel 2) -> {repr(pb_resp)}")
                     
-            except Exception as e:
-                logger.warning(f"MS-CAN probing failed: {e}")
+                        if pb_resp and "?" not in pb_resp:
+                            sp_resp = await self.connection.send_command("ATSPB")
+                            logger.info(f"  AT SP B -> {repr(sp_resp)}")
+                            if sp_resp and "?" not in sp_resp:
+                                ms_can_ok = True
+                                logger.info("  MS-CAN via ATPB E004 (channel 2)")
+                    
+                        # Fallback: C0 04 (channel 1 — won't work for MS-CAN on STN but
+                        # might work on some generic adapters with pin 3+11 wired)
+                        if not ms_can_ok:
+                            pb_resp2 = await self.connection.send_command("ATPBC004")
+                            logger.info(f"  ATPB C0 04 (channel 1 fallback) -> {repr(pb_resp2)}")
+                            if pb_resp2 and "?" not in pb_resp2:
+                                sp_resp2 = await self.connection.send_command("ATSPB")
+                                logger.info(f"  AT SP B -> {repr(sp_resp2)}")
+                                if sp_resp2 and "?" not in sp_resp2:
+                                    ms_can_ok = True
+                                    logger.info("  MS-CAN via ATPB C004 (channel 1 fallback)")
+                
+                    if ms_can_ok:
+                        # Enable headers for address identification
+                        await self.connection.send_command("ATH1")
+                        await self.connection.send_command("ATS1")
+                    
+                        # Set extended timeout for MS-CAN (slower bus)
+                        try:
+                            await self.connection.send_command("ATSTFF")
+                        except Exception:
+                            pass
+                    
+                        ms_can_found = 0
+                        for resp_addr, info in FORD_MS_CAN_ADDRESSES.items():
+                            req_addr = info["request"]
+                        
+                            try:
+                                # Target this address
+                                await self.connection.send_command(f"ATSH{req_addr:03X}")
+                                await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+                            
+                                # Try TesterPresent
+                                tp_resp = await self.connection.send_command("3E00", timeout=3.0)
+                                logger.info(f"  MS-CAN {req_addr:03X} TesterPresent -> {repr(tp_resp)}")
+                            
+                                if self._is_live_response(tp_resp):
+                                    module = ECUModule(
+                                        response_addr=resp_addr,
+                                        request_addr=req_addr,
+                                        name=info["name"],
+                                        description=info["description"],
+                                        bus="MS-CAN",
+                                    )
+                                    modules.append(module)
+                                    ms_can_found += 1
+                                    logger.info(f"  >>> MS-CAN Discovered: {info['name']} ({resp_addr:03X})")
+                                    continue
+                            
+                                # Try DiagnosticSessionControl
+                                dsc_resp = await self.connection.send_command("1001", timeout=3.0)
+                                logger.info(f"  MS-CAN {req_addr:03X} DiagSessionCtrl -> {repr(dsc_resp)}")
+                            
+                                if self._is_live_response(dsc_resp):
+                                    module = ECUModule(
+                                        response_addr=resp_addr,
+                                        request_addr=req_addr,
+                                        name=info["name"],
+                                        description=info["description"],
+                                        bus="MS-CAN",
+                                    )
+                                    modules.append(module)
+                                    ms_can_found += 1
+                                    logger.info(f"  >>> MS-CAN Discovered: {info['name']} ({resp_addr:03X})")
+                            
+                            except Exception as e:
+                                logger.debug(f"  MS-CAN {req_addr:03X}: exception: {e}")
+                    
+                        logger.info(f"Phase 3 complete: found {ms_can_found} MS-CAN module(s)")
+                    
+                        # Read UDS DIDs for each discovered MS-CAN module
+                        # (must do this while still on MS-CAN bus)
+                        for mod in modules:
+                            if mod.bus != "MS-CAN":
+                                continue
+                            try:
+                                logger.info(f"  Reading DIDs for {mod.name} ({mod.request_addr:03X})...")
+                                await self.connection.send_command(f"ATSH{mod.request_addr:03X}")
+                                await self.connection.send_command(f"ATCRA{mod.response_addr:03X}")
+                                mod.module_info = await self._read_module_dids(mod)
+                                if mod.module_info:
+                                    logger.info(f"  {mod.name}: {len(mod.module_info)} DID(s) read")
+                                else:
+                                    logger.info(f"  {mod.name}: no DIDs readable")
+                            except Exception as e:
+                                logger.debug(f"  {mod.name} DID read failed: {e}")
+                    
+                        # Reset CAN receive filter
+                        try:
+                            await self.connection.send_command("ATCRA")
+                        except Exception:
+                            pass
+                    else:
+                        logger.info("Phase 3 skipped: ELM327 does not support user-defined CAN protocols")
+                    
+                except Exception as e:
+                    logger.warning(f"MS-CAN probing failed: {e}")
             
         except Exception as e:
             logger.error(f"Module discovery failed: {e}")
@@ -861,11 +956,14 @@ class OBDProtocol:
         
         return supported
     
-    async def scan_all_modules(self) -> List[ECUModule]:
+    async def scan_all_modules(self, vin: str = None) -> List[ECUModule]:
         """
         Full module scan: discover all ECUs and enumerate each one's
         supported PIDs. For modules that don't support Mode 01, reports
         them as present with UDS-only capability.
+        
+        Args:
+            vin: Optional 17-char VIN for manufacturer-aware bus detection
         
         Returns:
             List of ECUModule objects with supported_pids populated
@@ -873,7 +971,7 @@ class OBDProtocol:
         from .pids import PIDRegistry
         
         # Step 1: Discover which modules are on the bus
-        modules = await self.discover_modules()
+        modules = await self.discover_modules(vin=vin)
         logger.info(f"Found {len(modules)} module(s), enumerating PIDs...")
         
         # Step 2: For each module, try to get its supported PIDs

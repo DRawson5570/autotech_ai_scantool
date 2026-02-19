@@ -231,11 +231,14 @@ class ELM327Service:
         Discover all ECU modules on the CAN bus and enumerate
         each module's supported PIDs.
         
+        Uses cached VIN (if available) to determine which secondary
+        buses to probe — e.g., Ford gets MS-CAN, others skip it.
+        
         Returns:
             List of ECUModule objects with supported_pids populated
         """
         self._ensure_connected()
-        return await self._protocol.scan_all_modules()
+        return await self._protocol.scan_all_modules(vin=self._vin)
     
     # -------------------------------------------------------------------------
     # DTC Operations
