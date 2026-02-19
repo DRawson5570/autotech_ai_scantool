@@ -498,6 +498,18 @@ class OBDProtocol:
             ms_can_ok = False
             stn_device = False
             try:
+                # --- Step 0: Identify the device we're actually talking to ---
+                ati_resp = await self.connection.send_command("ATI")
+                logger.info(f"  ATI (device ID) -> {repr(ati_resp)}")
+                
+                # STI = STN device info (OBDLink MX+ should return "STN2120 vX.X.X" or similar)
+                sti_resp = await self.connection.send_command("STI")
+                logger.info(f"  STI (STN device ID) -> {repr(sti_resp)}")
+                
+                # STDI = STN device description
+                stdi_resp = await self.connection.send_command("STDI")
+                logger.info(f"  STDI (STN description) -> {repr(stdi_resp)}")
+                
                 # --- Step 1: Switch physical CAN transceiver (STN/OBDLink devices) ---
                 # STCANSW 1 = use secondary CAN transceiver (pins 3+11)
                 # This is STN-specific; real ELM327 will return '?'
