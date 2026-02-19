@@ -515,47 +515,22 @@ class OBDProtocol:
                 
                 # --- Step 1: Try STN-specific MS-CAN switching methods ---
                 if stn_device:
-                    # Method A: STPC 2 — Select CAN channel 2 (pins 3+11) 
-                    for cmd in ["STPC2", "STPC 2"]:
-                        resp = await self.connection.send_command(cmd)
-                        logger.info(f"  {cmd} -> {repr(resp)}")
-                        if resp and "?" not in resp:
-                            logger.info("  CAN channel 2 selected via STPC")
-                            break
-                    
-                    # Method B: STCANSW 1 — older STN command
-                    for cmd in ["STCANSW1", "STCANSW 1"]:
-                        resp = await self.connection.send_command(cmd)
-                        logger.info(f"  {cmd} -> {repr(resp)}")
-                        if resp and "?" not in resp:
-                            logger.info("  CAN switch via STCANSW")
-                            break
-                    
-                    # Method C: STCSWM 2 — CAN switch mode 
-                    for cmd in ["STCSWM2", "STCSWM 2"]:
-                        resp = await self.connection.send_command(cmd)
-                        logger.info(f"  {cmd} -> {repr(resp)}")
-                        if resp and "?" not in resp:
-                            logger.info("  CAN switch mode set via STCSWM")
-                            break
-                    
-                    # Method D: STP 33 — STN built-in Ford MS-CAN protocol
-                    for cmd in ["STP33", "STP 33", "STP53", "STP 53"]:
+                    # STP33 is the proven working command on STN2255 (OBDLink MX+)
+                    # It selects Ford MS-CAN (125 kbps, pins 3+11) directly
+                    stn_methods = [
+                        ("STP33", "STN Ford MS-CAN protocol"),
+                        ("STPC2", "STN CAN channel 2"),
+                        ("STCANSW 1", "STN CAN switch"),
+                        ("STCSWM 2", "STN CAN switch mode"),
+                        ("STPBR 125000", "STN baud rate 125k"),
+                    ]
+                    for cmd, desc in stn_methods:
                         resp = await self.connection.send_command(cmd)
                         logger.info(f"  {cmd} -> {repr(resp)}")
                         if resp and "?" not in resp:
                             ms_can_ok = True
-                            logger.info(f"  MS-CAN via STN protocol: {cmd}")
+                            logger.info(f"  MS-CAN via {desc}: {cmd}")
                             break
-                    
-                    # Method E: STPBR — STN set Protocol B baud rate directly
-                    if not ms_can_ok:
-                        for cmd in ["STPBR125000", "STPBR 125000"]:
-                            resp = await self.connection.send_command(cmd)
-                            logger.info(f"  {cmd} -> {repr(resp)}")
-                            if resp and "?" not in resp:
-                                logger.info("  MS-CAN baud set via STPBR")
-                                break
                 
                 # --- Step 2: Configure Protocol B for 125 kbps ---
                 if not ms_can_ok:
@@ -657,8 +632,9 @@ class OBDProtocol:
         finally:
             # Restore to HS-CAN (Protocol 6) and default settings
             try:
-                # Switch CAN transceiver back to primary (pins 6+14)
-                for cmd in ["STPC1", "STPC 1", "STCANSW0", "STCANSW 0"]:
+                # Switch CAN transceiver back to HS-CAN (pins 6+14)
+                # STP6 resets STN to standard CAN 500k, STPC1 resets channel
+                for cmd in ["STP6", "STPC1"]:
                     try:
                         await self.connection.send_command(cmd)
                     except Exception:
