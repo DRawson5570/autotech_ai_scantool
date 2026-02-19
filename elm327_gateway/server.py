@@ -572,6 +572,7 @@ async def scan_modules():
                 "description": mod.description,
                 "response_addr": f"0x{mod.response_addr:03X}",
                 "request_addr": f"0x{mod.request_addr:03X}",
+                "bus": getattr(mod, 'bus', 'HS-CAN'),
                 "supported_pids": [
                     {"pid": pid, "name": name}
                     for pid, name in zip(mod.supported_pids, mod.pid_names)

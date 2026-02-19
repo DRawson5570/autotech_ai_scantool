@@ -76,7 +76,7 @@ class FreezeFrame:
 
 
 # Standard CAN OBD-II ECU address pairs (ISO 15765-4)
-# Request addr → Response addr = Module
+# Response addr → {request addr, name, description}
 ECU_ADDRESSES = {
     0x7E8: {"request": 0x7E0, "name": "PCM", "description": "Powertrain Control Module"},
     0x7E9: {"request": 0x7E1, "name": "TCM", "description": "Transmission Control Module"},
@@ -86,6 +86,30 @@ ECU_ADDRESSES = {
     0x7ED: {"request": 0x7E5, "name": "HVAC", "description": "Climate Control Module"},
     0x7EE: {"request": 0x7E6, "name": "ECU6", "description": "Module 6"},
     0x7EF: {"request": 0x7E7, "name": "ECU7", "description": "Module 7"},
+}
+
+# Ford MS-CAN module addresses (Medium Speed CAN, 125 kbps, pins 3+11)
+# These modules are NOT on the standard HS-CAN OBD-II bus.
+# Response addr → {request addr, name, description}
+FORD_MS_CAN_ADDRESSES = {
+    0x728: {"request": 0x720, "name": "PCM-MS", "description": "Powertrain Control Module (MS-CAN mirror)"},
+    0x729: {"request": 0x721, "name": "TCM", "description": "Transmission Control Module"},
+    0x72E: {"request": 0x726, "name": "APIM", "description": "Accessory Protocol Interface Module"},
+    0x72F: {"request": 0x727, "name": "ACM", "description": "Audio Control Module"},
+    0x739: {"request": 0x731, "name": "FCDIM", "description": "Front Camera Display Interface Module"},
+    0x73B: {"request": 0x733, "name": "IPMA", "description": "Image Processing Module A"},
+    0x748: {"request": 0x740, "name": "IPC", "description": "Instrument Panel Cluster"},
+    0x74E: {"request": 0x746, "name": "SCCM", "description": "Steering Column Control Module"},
+    0x758: {"request": 0x750, "name": "PAM", "description": "Parking Aid Module"},
+    0x768: {"request": 0x760, "name": "GEM", "description": "Generic Electronic Module (BCM)"},
+    0x76C: {"request": 0x764, "name": "RCM", "description": "Restraints Control Module (Airbag)"},
+    0x76D: {"request": 0x765, "name": "ABS", "description": "Anti-lock Braking System"},
+    0x7A8: {"request": 0x7A0, "name": "HVAC", "description": "HVAC Control Module"},
+    0x7B8: {"request": 0x7B0, "name": "TPMS", "description": "Tire Pressure Monitoring System"},
+    0x7C8: {"request": 0x7C0, "name": "PSCM", "description": "Power Steering Control Module"},
+    0x7CC: {"request": 0x7C4, "name": "DDM", "description": "Driver Door Module"},
+    0x7CD: {"request": 0x7C5, "name": "PDM", "description": "Passenger Door Module"},
+    0x7D8: {"request": 0x7D0, "name": "AWD", "description": "All-Wheel Drive Module"},
 }
 
 
@@ -98,6 +122,7 @@ class ECUModule:
     description: str            # e.g. "Powertrain Control Module"
     supported_pids: List[int] = field(default_factory=list)
     pid_names: List[str] = field(default_factory=list)
+    bus: str = "HS-CAN"         # "HS-CAN" (500 kbps) or "MS-CAN" (125 kbps)
 
 
 class OBDProtocol:
@@ -463,11 +488,117 @@ class OBDProtocol:
             except Exception:
                 pass
             
+            # --- Phase 3: Probe MS-CAN (125 kbps) for body/comfort modules ---
+            # Ford (and some other makes) put non-emission modules on a second,
+            # slower CAN bus accessible via OBD-II pins 3+11.
+            # ELM327 can switch to this bus using Protocol B (user-defined CAN).
+            logger.info("Phase 3: Switching to MS-CAN (125 kbps) for body/comfort modules...")
+            
+            ms_can_ok = False
+            try:
+                # Save current protocol for restore
+                # Configure Protocol B: 11-bit CAN, ISO 15765-4 framing, 125 kbps
+                # AT PB xx yy: xx=C0 (11-bit + ISO framing), yy=04 (500/4=125 kbps)
+                pb_resp = await self.connection.send_command("ATPBC004")
+                logger.info(f"  ATPB C0 04 -> {repr(pb_resp)}")
+                
+                if pb_resp and "?" not in pb_resp:
+                    # Switch to protocol B
+                    sp_resp = await self.connection.send_command("ATSPB")
+                    logger.info(f"  AT SP B -> {repr(sp_resp)}")
+                    
+                    if sp_resp and "?" not in sp_resp:
+                        ms_can_ok = True
+                    else:
+                        logger.info("  ELM327 does not support Protocol B")
+                else:
+                    logger.info("  ELM327 does not support ATPB command")
+                
+                if not ms_can_ok:
+                    # Try alternative baud divisor (some clones use different formula)
+                    pb_resp2 = await self.connection.send_command("ATPBC009")
+                    logger.info(f"  ATPB C0 09 (alt) -> {repr(pb_resp2)}")
+                    if pb_resp2 and "?" not in pb_resp2:
+                        sp_resp2 = await self.connection.send_command("ATSPB")
+                        logger.info(f"  AT SP B (alt) -> {repr(sp_resp2)}")
+                        if sp_resp2 and "?" not in sp_resp2:
+                            ms_can_ok = True
+                
+                if ms_can_ok:
+                    # Enable headers for address identification
+                    await self.connection.send_command("ATH1")
+                    await self.connection.send_command("ATS1")
+                    
+                    # Set extended timeout for MS-CAN (slower bus)
+                    try:
+                        await self.connection.send_command("ATSTFF")
+                    except Exception:
+                        pass
+                    
+                    ms_can_found = 0
+                    for resp_addr, info in FORD_MS_CAN_ADDRESSES.items():
+                        req_addr = info["request"]
+                        
+                        try:
+                            # Target this address
+                            await self.connection.send_command(f"ATSH{req_addr:03X}")
+                            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+                            
+                            # Try TesterPresent
+                            tp_resp = await self.connection.send_command("3E00", timeout=3.0)
+                            logger.info(f"  MS-CAN {req_addr:03X} TesterPresent -> {repr(tp_resp)}")
+                            
+                            if self._is_live_response(tp_resp):
+                                module = ECUModule(
+                                    response_addr=resp_addr,
+                                    request_addr=req_addr,
+                                    name=info["name"],
+                                    description=info["description"],
+                                    bus="MS-CAN",
+                                )
+                                modules.append(module)
+                                ms_can_found += 1
+                                logger.info(f"  >>> MS-CAN Discovered: {info['name']} ({resp_addr:03X})")
+                                continue
+                            
+                            # Try DiagnosticSessionControl
+                            dsc_resp = await self.connection.send_command("1001", timeout=3.0)
+                            logger.info(f"  MS-CAN {req_addr:03X} DiagSessionCtrl -> {repr(dsc_resp)}")
+                            
+                            if self._is_live_response(dsc_resp):
+                                module = ECUModule(
+                                    response_addr=resp_addr,
+                                    request_addr=req_addr,
+                                    name=info["name"],
+                                    description=info["description"],
+                                    bus="MS-CAN",
+                                )
+                                modules.append(module)
+                                ms_can_found += 1
+                                logger.info(f"  >>> MS-CAN Discovered: {info['name']} ({resp_addr:03X})")
+                            
+                        except Exception as e:
+                            logger.debug(f"  MS-CAN {req_addr:03X}: exception: {e}")
+                    
+                    logger.info(f"Phase 3 complete: found {ms_can_found} MS-CAN module(s)")
+                    
+                    # Reset CAN receive filter
+                    try:
+                        await self.connection.send_command("ATCRA")
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Phase 3 skipped: ELM327 does not support user-defined CAN protocols")
+                    
+            except Exception as e:
+                logger.warning(f"MS-CAN probing failed: {e}")
+            
         except Exception as e:
             logger.error(f"Module discovery failed: {e}")
         finally:
-            # Restore settings
+            # Restore to HS-CAN (Protocol 6) and default settings
             try:
+                await self.connection.send_command("ATSP6")   # Back to ISO 15765-4 CAN 500k
                 await self.connection.send_command("ATSH7DF")  # Reset to broadcast
                 await self.connection.send_command("ATH0")
                 await self.connection.send_command("ATS0")
