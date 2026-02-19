@@ -388,66 +388,80 @@ class OBDProtocol:
             if response and "NO DATA" not in response.upper() and "ERROR" not in response.upper():
                 self._parse_module_response(response, seen_addrs, modules)
             
-            # --- Phase 2: Probe each address with UDS TesterPresent ---
+            # --- Phase 2: Probe each address individually ---
             # Catches non-emission modules (ABS, SRS, BCM, HVAC, etc.)
+            # Uses multiple UDS services since not all modules support all services
+            logger.info(f"Phase 2: Probing addresses 7E0-7E7 individually (skipping {[f'{a:03X}' for a in seen_addrs]})")
+            
             for req_addr in range(0x7E0, 0x7E8):
                 resp_addr = req_addr + 8  # 7E0→7E8, 7E1→7E9, etc.
                 if resp_addr in seen_addrs:
-                    continue  # Already found via broadcast
+                    logger.info(f"  {req_addr:03X}: skipping (already found)")
+                    continue
                 
                 try:
                     # Target this specific address
-                    await self.connection.send_command(f"ATSH{req_addr:03X}")
+                    sh_resp = await self.connection.send_command(f"ATSH{req_addr:03X}")
+                    logger.info(f"  ATSH{req_addr:03X} -> {repr(sh_resp)}")
                     
-                    # Send UDS TesterPresent (service 0x3E, sub-function 0x00)
-                    # Positive response = 7E 00
-                    tp_response = await self.connection.send_command("3E00", timeout=2.0)
-                    logger.debug(f"TesterPresent to {req_addr:03X}: {repr(tp_response)}")
+                    # Also set CAN receive address filter to match expected response
+                    cra_resp = await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+                    logger.info(f"  ATCRA{resp_addr:03X} -> {repr(cra_resp)}")
                     
-                    if tp_response and "NO DATA" not in tp_response.upper() and "ERROR" not in tp_response.upper():
-                        # Got a response — module is alive
-                        # Check for positive response (7E) or any non-error
-                        if "7E" in tp_response.upper():
-                            info = ECU_ADDRESSES.get(resp_addr, {
-                                "request": req_addr,
-                                "name": f"ECU-{resp_addr:03X}",
-                                "description": f"Module at {resp_addr:03X}"
-                            })
-                            module = ECUModule(
-                                response_addr=resp_addr,
-                                request_addr=req_addr,
-                                name=info["name"],
-                                description=info["description"],
-                            )
-                            modules.append(module)
-                            seen_addrs.add(resp_addr)
-                            logger.info(f"Discovered module via TesterPresent: {info['name']} ({resp_addr:03X})")
-                            continue
+                    found = False
                     
-                    # Phase 2b: Try Mode 01 PID 00 targeted (some modules
-                    # respond to targeted but not broadcast)
-                    obd_response = await self.connection.send_command("0100", timeout=2.0)
-                    logger.debug(f"Targeted 0100 to {req_addr:03X}: {repr(obd_response)}")
+                    # --- Try 1: UDS TesterPresent (3E 00) ---
+                    tp_response = await self.connection.send_command("3E00", timeout=3.0)
+                    logger.info(f"  {req_addr:03X} TesterPresent(3E00) -> {repr(tp_response)}")
                     
-                    if obd_response and "NO DATA" not in obd_response.upper() and "ERROR" not in obd_response.upper():
-                        if "41 00" in obd_response or "4100" in obd_response:
-                            info = ECU_ADDRESSES.get(resp_addr, {
-                                "request": req_addr,
-                                "name": f"ECU-{resp_addr:03X}",
-                                "description": f"Module at {resp_addr:03X}"
-                            })
-                            module = ECUModule(
-                                response_addr=resp_addr,
-                                request_addr=req_addr,
-                                name=info["name"],
-                                description=info["description"],
-                            )
-                            modules.append(module)
-                            seen_addrs.add(resp_addr)
-                            logger.info(f"Discovered module via targeted 0100: {info['name']} ({resp_addr:03X})")
+                    if self._is_live_response(tp_response):
+                        found = True
+                        logger.info(f"  {req_addr:03X}: ALIVE via TesterPresent")
+                    
+                    # --- Try 2: UDS DiagnosticSessionControl (10 01) ---
+                    if not found:
+                        dsc_response = await self.connection.send_command("1001", timeout=3.0)
+                        logger.info(f"  {req_addr:03X} DiagSessionCtrl(1001) -> {repr(dsc_response)}")
+                        
+                        if self._is_live_response(dsc_response):
+                            found = True
+                            logger.info(f"  {req_addr:03X}: ALIVE via DiagSessionControl")
+                    
+                    # --- Try 3: Mode 01 PID 00 targeted ---
+                    if not found:
+                        obd_response = await self.connection.send_command("0100", timeout=3.0)
+                        logger.info(f"  {req_addr:03X} Mode01PID00(0100) -> {repr(obd_response)}")
+                        
+                        if self._is_live_response(obd_response):
+                            found = True
+                            logger.info(f"  {req_addr:03X}: ALIVE via targeted Mode 01")
+                    
+                    if found:
+                        info = ECU_ADDRESSES.get(resp_addr, {
+                            "request": req_addr,
+                            "name": f"ECU-{resp_addr:03X}",
+                            "description": f"Module at {resp_addr:03X}"
+                        })
+                        module = ECUModule(
+                            response_addr=resp_addr,
+                            request_addr=req_addr,
+                            name=info["name"],
+                            description=info["description"],
+                        )
+                        modules.append(module)
+                        seen_addrs.add(resp_addr)
+                        logger.info(f"  >>> Discovered: {info['name']} ({resp_addr:03X})")
+                    else:
+                        logger.info(f"  {req_addr:03X}: no response")
                     
                 except Exception as e:
-                    logger.debug(f"No response from {req_addr:03X}: {e}")
+                    logger.info(f"  {req_addr:03X}: exception: {e}")
+            
+            # Reset CAN receive filter
+            try:
+                await self.connection.send_command("ATCRA")
+            except Exception:
+                pass
             
         except Exception as e:
             logger.error(f"Module discovery failed: {e}")
@@ -503,6 +517,21 @@ class OBDProtocol:
             )
             modules.append(module)
             logger.info(f"Discovered module via broadcast: {info['name']} ({addr_str})")
+    
+    @staticmethod
+    def _is_live_response(response: str) -> bool:
+        """Check if ELM327 response indicates a live module (any non-error response)."""
+        if not response:
+            return False
+        upper = response.upper().strip()
+        if not upper:
+            return False
+        # These indicate NO module responded
+        dead_patterns = ["NO DATA", "ERROR", "UNABLE", "CAN ERROR", "BUS", "STOPPED", "?"]
+        for pat in dead_patterns:
+            if pat in upper:
+                return False
+        return True
     
     async def get_module_supported_pids(self, request_addr: int) -> List[int]:
         """

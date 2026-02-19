@@ -121,9 +121,26 @@ class ELM327Connection(ABC):
         
         # Remove echo if present (command echoed back)
         lines = [l.strip() for l in response.split('\n') if l.strip()]
-        if lines and not lines[0].startswith('4') and not lines[0].startswith('7E'):
-            # OBD responses start with 4x (no headers) or 7Ex (with CAN headers)
-            lines = lines[1:]  # Remove echo
+        if len(lines) >= 2:
+            first = lines[0].upper()
+            # Only strip echo if line is NOT a known ELM327 response
+            is_response = (
+                first.startswith('4') or        # OBD responses (41, 43, 49...)
+                first.startswith('7E') or        # CAN header (7E8, 7E9...)
+                first.startswith('7F') or        # UDS negative response
+                first.startswith('OK') or        # AT command success
+                first.startswith('NO DATA') or   # No response from module
+                first.startswith('NO ') or        # Other "NO" messages
+                first.startswith('?') or          # Unknown command
+                first.startswith('UNABLE') or    # Connection error
+                first.startswith('CAN') or        # CAN ERROR
+                first.startswith('BUS') or        # BUS errors
+                first.startswith('STOPPED') or   # Interrupted
+                first.startswith('SEARCHING') or # Protocol search
+                first.startswith('ERROR')        # General error
+            )
+            if not is_response:
+                lines = lines[1:]  # Remove echo
         
         return '\n'.join(lines)
 
