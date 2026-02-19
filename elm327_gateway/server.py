@@ -35,8 +35,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-from addons.scan_tool.service import ELM327Service
-from addons.scan_tool.session import get_session, reset_session, DiagnosticSession
+from .service import ELM327Service
+from .session import get_session, reset_session, DiagnosticSession
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -526,7 +526,7 @@ async def get_supported_pids_list():
         supported = [p for p in supported if p not in BITMAP_PIDS]
         
         # Resolve PID numbers to names
-        from addons.scan_tool.pids import PIDRegistry
+        from .pids import PIDRegistry
         pid_names = []
         for pid_num in sorted(supported):
             defn = PIDRegistry.get(pid_num)
@@ -650,7 +650,7 @@ async def list_actuators():
         else:
             supported = []
         
-        from addons.scan_tool.bidirectional import STANDARD_ACTUATORS, ActuatorType
+        from .bidirectional import STANDARD_ACTUATORS, ActuatorType
         
         actuators = []
         for act_type, defn in STANDARD_ACTUATORS.items():
