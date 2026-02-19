@@ -24,14 +24,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
-from elm327_gateway.connection import (
+from .connection import (
     ConnectionType,
     ELM327Connection,
     create_connection,
     DEFAULT_ADDRESSES,
 )
-from elm327_gateway.protocol import OBDProtocol, DTC, get_dtc_description
-from elm327_gateway.pids import (
+from .protocol import OBDProtocol, DTC, get_dtc_description
+from .pids import (
     PIDRegistry,
     PIDDefinition,
     get_pid_by_name,
@@ -40,7 +40,7 @@ from elm327_gateway.pids import (
     OXYGEN_PIDS,
     TEMPERATURE_PIDS,
 )
-from elm327_gateway.bidirectional import ActuatorControl, ActuatorType, ActuatorState
+from .bidirectional import ActuatorControl, ActuatorType, ActuatorState
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,17 @@ class ELM327Service:
         if not self._supported_pids:
             self._supported_pids = await self._protocol.get_supported_pids()
         return self._supported_pids
+    
+    async def scan_modules(self) -> list:
+        """
+        Discover all ECU modules on the CAN bus and enumerate
+        each module's supported PIDs.
+        
+        Returns:
+            List of ECUModule objects with supported_pids populated
+        """
+        self._ensure_connected()
+        return await self._protocol.scan_all_modules()
     
     # -------------------------------------------------------------------------
     # DTC Operations

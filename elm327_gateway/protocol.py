@@ -75,6 +75,31 @@ class FreezeFrame:
     data: Dict[str, float] = field(default_factory=dict)
 
 
+# Standard CAN OBD-II ECU address pairs (ISO 15765-4)
+# Request addr → Response addr = Module
+ECU_ADDRESSES = {
+    0x7E8: {"request": 0x7E0, "name": "PCM", "description": "Powertrain Control Module"},
+    0x7E9: {"request": 0x7E1, "name": "TCM", "description": "Transmission Control Module"},
+    0x7EA: {"request": 0x7E2, "name": "ABS", "description": "Anti-lock Brake System"},
+    0x7EB: {"request": 0x7E3, "name": "SRS", "description": "Supplemental Restraint System (Airbag)"},
+    0x7EC: {"request": 0x7E4, "name": "BCM", "description": "Body Control Module"},
+    0x7ED: {"request": 0x7E5, "name": "HVAC", "description": "Climate Control Module"},
+    0x7EE: {"request": 0x7E6, "name": "ECU6", "description": "Module 6"},
+    0x7EF: {"request": 0x7E7, "name": "ECU7", "description": "Module 7"},
+}
+
+
+@dataclass
+class ECUModule:
+    """Represents a discovered ECU module on the CAN bus."""
+    response_addr: int          # e.g. 0x7E8
+    request_addr: int           # e.g. 0x7E0
+    name: str                   # e.g. "PCM"
+    description: str            # e.g. "Powertrain Control Module"
+    supported_pids: List[int] = field(default_factory=list)
+    pid_names: List[str] = field(default_factory=list)
+
+
 class OBDProtocol:
     """OBD-II protocol handler for ELM327."""
     
@@ -319,6 +344,199 @@ class OBDProtocol:
             List of DTC objects
         """
         return await self._read_dtcs_all_modules("0A", "permanent")
+    
+    # -------------------------------------------------------------------------
+    # Module Discovery & Per-Module PID Enumeration
+    # -------------------------------------------------------------------------
+    
+    async def discover_modules(self) -> List[ECUModule]:
+        """
+        Discover all ECU modules on the CAN bus by broadcasting
+        PID-supported request (0100) with headers enabled.
+        
+        Every ECU that supports Mode 01 will respond from its
+        unique CAN address (7E8=PCM, 7E9=TCM, 7EA=ABS, etc.).
+        
+        Returns:
+            List of ECUModule objects for each responding module
+        """
+        modules = []
+        
+        try:
+            # Enable headers and spaces so we can see which address replied
+            await self.connection.send_command("ATH1")
+            await self.connection.send_command("ATS1")
+            
+            # Set timeout to max so slow modules have time to respond
+            # ATSTFF = 255 * 4ms = ~1 second (ELM327 v1.3+)
+            try:
+                await self.connection.send_command("ATSTFF")
+            except Exception:
+                # Older adapters may not support ATSTFF; use AT ST FF
+                try:
+                    await self.connection.send_command("AT ST FF")
+                except Exception:
+                    logger.debug("Could not set extended timeout")
+            
+            # Broadcast Mode 01 PID 00 — every OBD-II ECU must support this
+            response = await self.connection.send_command("0100", timeout=5.0)
+            logger.info(f"Module discovery raw response: {repr(response)}")
+            
+            if not response or "NO DATA" in response.upper() or "ERROR" in response.upper():
+                return modules
+            
+            # Parse response lines — each ECU responds on its own line
+            # Format: "7E8 06 41 00 BE 3F A8 13"
+            seen_addrs = set()
+            for line in response.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                
+                # First token should be a 3-char CAN address (e.g. 7E8)
+                addr_str = parts[0].upper()
+                if len(addr_str) != 3:
+                    continue
+                try:
+                    resp_addr = int(addr_str, 16)
+                except ValueError:
+                    continue
+                
+                # Only count standard OBD-II response range (7E8-7EF)
+                if resp_addr < 0x7E8 or resp_addr > 0x7EF:
+                    continue
+                
+                if resp_addr in seen_addrs:
+                    continue
+                seen_addrs.add(resp_addr)
+                
+                # Look up module info
+                info = ECU_ADDRESSES.get(resp_addr, {
+                    "request": resp_addr - 8,
+                    "name": f"ECU-{addr_str}",
+                    "description": f"Unknown Module ({addr_str})"
+                })
+                
+                module = ECUModule(
+                    response_addr=resp_addr,
+                    request_addr=info["request"],
+                    name=info["name"],
+                    description=info["description"],
+                )
+                modules.append(module)
+                logger.info(f"Discovered module: {info['name']} ({addr_str})")
+            
+        except Exception as e:
+            logger.error(f"Module discovery failed: {e}")
+        finally:
+            # Restore settings
+            try:
+                await self.connection.send_command("ATH0")
+                await self.connection.send_command("ATS0")
+                # Reset timeout to default
+                await self.connection.send_command("ATST32")
+            except Exception as e:
+                logger.warning(f"Failed to restore AT settings: {e}")
+        
+        return modules
+    
+    async def get_module_supported_pids(self, request_addr: int) -> List[int]:
+        """
+        Enumerate all supported Mode 01 PIDs for a specific ECU module.
+        
+        Targets the module directly using AT SH (set header) so only
+        that module responds, then chains PID-supported bitmap requests.
+        
+        Args:
+            request_addr: CAN request address (e.g. 0x7E0 for PCM)
+            
+        Returns:
+            List of supported PID numbers for this module
+        """
+        supported = []
+        
+        try:
+            # Target this specific module by setting the transmit header
+            await self.connection.send_command(f"ATSH{request_addr:03X}")
+            logger.info(f"Targeting module at request addr {request_addr:03X}")
+            
+            # Chain through PID-supported bitmaps: 0x00, 0x20, 0x40, ...
+            for base_pid in [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0]:
+                try:
+                    response = await self.connection.send_command(
+                        f"01{base_pid:02X}", timeout=3.0
+                    )
+                    if not response or "NO DATA" in response or "ERROR" in response:
+                        break
+                    
+                    # Parse: 41 XX YY YY YY YY
+                    data = self._parse_response(response)
+                    if data and len(data) >= 4:
+                        bitmap = (data[0] << 24) | (data[1] << 16) | (data[2] << 8) | data[3]
+                        for i in range(32):
+                            if bitmap & (1 << (31 - i)):
+                                supported.append(base_pid + i + 1)
+                        
+                        # If bit 32 (last) not set, no more ranges
+                        if not (bitmap & 1):
+                            break
+                    else:
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"Error checking module {request_addr:03X} PID {base_pid:02X}: {e}")
+                    break
+            
+        except Exception as e:
+            logger.error(f"Module PID enumeration failed for {request_addr:03X}: {e}")
+        finally:
+            # Reset header back to default broadcast (7DF)
+            try:
+                await self.connection.send_command("ATSH7DF")
+            except Exception as e:
+                logger.warning(f"Failed to reset AT SH: {e}")
+        
+        return supported
+    
+    async def scan_all_modules(self) -> List[ECUModule]:
+        """
+        Full module scan: discover all ECUs and enumerate each one's
+        supported PIDs.
+        
+        Returns:
+            List of ECUModule objects with supported_pids populated
+        """
+        from .pids import PIDRegistry
+        
+        # Step 1: Discover which modules are on the bus
+        modules = await self.discover_modules()
+        logger.info(f"Found {len(modules)} module(s), enumerating PIDs...")
+        
+        # Step 2: For each module, get its supported PIDs
+        for module in modules:
+            pids = await self.get_module_supported_pids(module.request_addr)
+            # Filter out bitmap PIDs (0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0)
+            bitmap_pids = {0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0}
+            module.supported_pids = [p for p in pids if p not in bitmap_pids]
+            
+            # Resolve PID names
+            for pid in module.supported_pids:
+                defn = PIDRegistry.get(pid)
+                if defn:
+                    module.pid_names.append(defn.name)
+                else:
+                    module.pid_names.append(f"PID_0x{pid:02X}")
+            
+            logger.info(
+                f"Module {module.name} ({module.request_addr:03X}): "
+                f"{len(module.supported_pids)} PIDs"
+            )
+        
+        return modules
     
     async def _read_dtcs_all_modules(self, mode: str, status: str) -> List[DTC]:
         """

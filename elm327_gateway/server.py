@@ -12,7 +12,7 @@ Features:
 - REST API + WebSocket for real-time data
 
 Usage:
-    python -m elm327_gateway.server --port 8327
+    python -m addons.scan_tool.gateway.server --port 8327
 
 iPhone connects to: http://<hostname>.local:8327/ui
 """
@@ -31,9 +31,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # Import our ELM327 service
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
-from elm327_gateway.service import ELM327Service
-from elm327_gateway.session import get_session, reset_session, DiagnosticSession
+from .service import ELM327Service
+from .session import get_session, reset_session, DiagnosticSession
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -157,7 +160,7 @@ _server_port = 8327
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    logger.info("ELM327 Gateway starting...")
+    logger.info("🚗 ELM327 Gateway starting...")
     start_mdns_service(_server_port)
     yield
     # Cleanup on shutdown
@@ -381,7 +384,7 @@ async def connect(req: ConnectRequest):
     global _elm, _connected_at
     
     try:
-        # If already connected to the same address, skip reconnection
+        # If already connected, skip reconnection
         if _elm and _elm.connected:
             vin = _elm.vin
             supported = await _elm.get_supported_pids()
@@ -523,7 +526,7 @@ async def get_supported_pids_list():
         supported = [p for p in supported if p not in BITMAP_PIDS]
         
         # Resolve PID numbers to names
-        from elm327_gateway.pids import PIDRegistry
+        from .pids import PIDRegistry
         pid_names = []
         for pid_num in sorted(supported):
             defn = PIDRegistry.get(pid_num)
@@ -547,6 +550,38 @@ async def get_supported_pids_list():
         return {
             "supported_pids": pid_names,
             "count": len(pid_names),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/modules")
+async def scan_modules():
+    """Discover all ECU modules on the CAN bus and list their supported PIDs."""
+    _require_connection()
+    
+    try:
+        modules = await _elm.scan_modules()
+        
+        result = []
+        for mod in modules:
+            result.append({
+                "name": mod.name,
+                "description": mod.description,
+                "response_addr": f"0x{mod.response_addr:03X}",
+                "request_addr": f"0x{mod.request_addr:03X}",
+                "supported_pids": [
+                    {"pid": pid, "name": name}
+                    for pid, name in zip(mod.supported_pids, mod.pid_names)
+                ],
+                "pid_count": len(mod.supported_pids),
+            })
+        
+        return {
+            "modules": result,
+            "module_count": len(result),
             "timestamp": datetime.now().isoformat()
         }
         
@@ -613,7 +648,7 @@ async def list_actuators():
         else:
             supported = []
         
-        from elm327_gateway.bidirectional import STANDARD_ACTUATORS, ActuatorType
+        from .bidirectional import STANDARD_ACTUATORS, ActuatorType
         
         actuators = []
         for act_type, defn in STANDARD_ACTUATORS.items():
@@ -1323,24 +1358,24 @@ if __name__ == "__main__":
     hostname = socket.gethostname()
     
     print(f"""
-+==============================================================+
-|                    ELM327 Gateway Server                     |
-+==============================================================+
-|                                                              |
-|  iPhone/iPad (Bonjour auto-discovery):                       |
-|     http://{hostname}.local:{args.port}/ui{' ' * (27 - len(hostname) - len(str(args.port)))}|
-|                                                              |
-|  Any device (direct IP):                                     |
-|     http://{local_ip}:{args.port}/ui{' ' * (33 - len(local_ip) - len(str(args.port)))}|
-|                                                              |
-|  Scan QR code:                                               |
-|     http://{local_ip}:{args.port}/qr{' ' * (33 - len(local_ip) - len(str(args.port)))}|
-|                                                              |
-+==============================================================+
-|  Windows: Use COMx port (check Device Manager)               |
-|  Linux:   Use /dev/rfcomm0 (run setup_bluetooth.sh first)    |
-|  WiFi:    Use 192.168.0.10:35000                             |
-+==============================================================+
+╔══════════════════════════════════════════════════════════════╗
+║                    ELM327 Gateway Server                     ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  📱 iPhone/iPad (Bonjour auto-discovery):                    ║
+║     http://{hostname}.local:{args.port}/ui{' ' * (27 - len(hostname) - len(str(args.port)))}║
+║                                                              ║
+║  📱 Any device (direct IP):                                  ║
+║     http://{local_ip}:{args.port}/ui{' ' * (33 - len(local_ip) - len(str(args.port)))}║
+║                                                              ║
+║  📷 Scan QR code:                                            ║
+║     http://{local_ip}:{args.port}/qr{' ' * (33 - len(local_ip) - len(str(args.port)))}║
+║                                                              ║
+╠══════════════════════════════════════════════════════════════╣
+║  Windows: Use COMx port (check Device Manager)               ║
+║  Linux:   Use /dev/rfcomm0 (run setup_bluetooth.sh first)    ║
+║  WiFi:    Use 192.168.0.10:35000                             ║
+╚══════════════════════════════════════════════════════════════╝
 """)
     
     uvicorn.run(app, host=args.host, port=args.port)
