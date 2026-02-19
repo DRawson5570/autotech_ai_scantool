@@ -491,77 +491,97 @@ class OBDProtocol:
             # --- Phase 3: Probe MS-CAN (125 kbps) for body/comfort modules ---
             # Ford (and some other makes) put non-emission modules on a second,
             # slower CAN bus accessible via OBD-II pins 3+11.
-            # OBDLink MX+ (STN chip) requires STCANSW 1 to switch physical transceiver.
-            # Generic ELM327 clones typically can't do this (single transceiver).
+            # OBDLink MX+ (STN2255) needs CAN channel 2 selection via STPBR/STPC
+            # or ATPB with channel bit set (bit 5 of config byte).
             logger.info("Phase 3: Switching to MS-CAN (125 kbps, pins 3+11)...")
             
             ms_can_ok = False
             stn_device = False
             try:
-                # --- Step 0: Identify the device we're actually talking to ---
+                # --- Step 0: Identify the device ---
                 ati_resp = await self.connection.send_command("ATI")
                 logger.info(f"  ATI (device ID) -> {repr(ati_resp)}")
                 
-                # STI = STN device info (OBDLink MX+ should return "STN2120 vX.X.X" or similar)
                 sti_resp = await self.connection.send_command("STI")
                 logger.info(f"  STI (STN device ID) -> {repr(sti_resp)}")
                 
-                # STDI = STN device description
                 stdi_resp = await self.connection.send_command("STDI")
                 logger.info(f"  STDI (STN description) -> {repr(stdi_resp)}")
                 
-                # --- Step 1: Switch physical CAN transceiver (STN/OBDLink devices) ---
-                # STCANSW 1 = use secondary CAN transceiver (pins 3+11)
-                # This is STN-specific; real ELM327 will return '?'
-                sw_resp = await self.connection.send_command("STCANSW1")
-                logger.info(f"  STCANSW 1 -> {repr(sw_resp)}")
-                
-                if sw_resp and "?" not in sw_resp:
+                # Check if this is an STN device
+                if sti_resp and "?" not in sti_resp and "STN" in sti_resp.upper():
                     stn_device = True
-                    logger.info("  STN/OBDLink device detected — CAN switched to pins 3+11")
-                else:
-                    # Try with space
-                    sw_resp2 = await self.connection.send_command("STCANSW 1")
-                    logger.info(f"  STCANSW 1 (spaced) -> {repr(sw_resp2)}")
-                    if sw_resp2 and "?" not in sw_resp2:
-                        stn_device = True
-                        logger.info("  STN/OBDLink device detected — CAN switched to pins 3+11")
-                    else:
-                        logger.info("  Not an STN device (no STCANSW support)")
+                    logger.info(f"  Confirmed STN device: {sti_resp}")
+                
+                # --- Step 1: Try STN-specific MS-CAN switching methods ---
+                if stn_device:
+                    # Method A: STPC 2 — Select CAN channel 2 (pins 3+11) 
+                    for cmd in ["STPC2", "STPC 2"]:
+                        resp = await self.connection.send_command(cmd)
+                        logger.info(f"  {cmd} -> {repr(resp)}")
+                        if resp and "?" not in resp:
+                            logger.info("  CAN channel 2 selected via STPC")
+                            break
+                    
+                    # Method B: STCANSW 1 — older STN command
+                    for cmd in ["STCANSW1", "STCANSW 1"]:
+                        resp = await self.connection.send_command(cmd)
+                        logger.info(f"  {cmd} -> {repr(resp)}")
+                        if resp and "?" not in resp:
+                            logger.info("  CAN switch via STCANSW")
+                            break
+                    
+                    # Method C: STCSWM 2 — CAN switch mode 
+                    for cmd in ["STCSWM2", "STCSWM 2"]:
+                        resp = await self.connection.send_command(cmd)
+                        logger.info(f"  {cmd} -> {repr(resp)}")
+                        if resp and "?" not in resp:
+                            logger.info("  CAN switch mode set via STCSWM")
+                            break
+                    
+                    # Method D: STP 33 — STN built-in Ford MS-CAN protocol
+                    for cmd in ["STP33", "STP 33", "STP53", "STP 53"]:
+                        resp = await self.connection.send_command(cmd)
+                        logger.info(f"  {cmd} -> {repr(resp)}")
+                        if resp and "?" not in resp:
+                            ms_can_ok = True
+                            logger.info(f"  MS-CAN via STN protocol: {cmd}")
+                            break
+                    
+                    # Method E: STPBR — STN set Protocol B baud rate directly
+                    if not ms_can_ok:
+                        for cmd in ["STPBR125000", "STPBR 125000"]:
+                            resp = await self.connection.send_command(cmd)
+                            logger.info(f"  {cmd} -> {repr(resp)}")
+                            if resp and "?" not in resp:
+                                logger.info("  MS-CAN baud set via STPBR")
+                                break
                 
                 # --- Step 2: Configure Protocol B for 125 kbps ---
-                # AT PB xx yy: xx=C0 (11-bit + ISO framing), yy=04 (500/4=125 kbps)
-                pb_resp = await self.connection.send_command("ATPBC004")
-                logger.info(f"  ATPB C0 04 -> {repr(pb_resp)}")
-                
-                if pb_resp and "?" not in pb_resp:
-                    # Switch to protocol B
-                    sp_resp = await self.connection.send_command("ATSPB")
-                    logger.info(f"  AT SP B -> {repr(sp_resp)}")
-                    
-                    if sp_resp and "?" not in sp_resp:
-                        ms_can_ok = True
-                    else:
-                        logger.info("  Protocol B not accepted")
-                else:
-                    logger.info("  ATPB not supported")
-                
-                if not ms_can_ok and stn_device:
-                    # OBDLink alternative: use STP 53 (Ford MS-CAN built-in protocol)
-                    stp_resp = await self.connection.send_command("STP53")
-                    logger.info(f"  STP 53 (Ford MS-CAN) -> {repr(stp_resp)}")
-                    if stp_resp and "?" not in stp_resp:
-                        ms_can_ok = True
-                
                 if not ms_can_ok:
-                    # Try alternative baud divisor
-                    pb_resp2 = await self.connection.send_command("ATPBC009")
-                    logger.info(f"  ATPB C0 09 (alt) -> {repr(pb_resp2)}")
-                    if pb_resp2 and "?" not in pb_resp2:
-                        sp_resp2 = await self.connection.send_command("ATSPB")
-                        logger.info(f"  AT SP B (alt) -> {repr(sp_resp2)}")
-                        if sp_resp2 and "?" not in sp_resp2:
+                    # ATPB E0 04: E0 = ISO 15765-4 + 11-bit + CAN channel 2 (bit 5)
+                    # This tells STN devices to use the secondary CAN transceiver
+                    pb_resp = await self.connection.send_command("ATPBE004")
+                    logger.info(f"  ATPB E0 04 (channel 2) -> {repr(pb_resp)}")
+                    
+                    if pb_resp and "?" not in pb_resp:
+                        sp_resp = await self.connection.send_command("ATSPB")
+                        logger.info(f"  AT SP B -> {repr(sp_resp)}")
+                        if sp_resp and "?" not in sp_resp:
                             ms_can_ok = True
+                            logger.info("  MS-CAN via ATPB E004 (channel 2)")
+                    
+                    # Fallback: C0 04 (channel 1 — won't work for MS-CAN on STN but
+                    # might work on some generic adapters with pin 3+11 wired)
+                    if not ms_can_ok:
+                        pb_resp2 = await self.connection.send_command("ATPBC004")
+                        logger.info(f"  ATPB C0 04 (channel 1 fallback) -> {repr(pb_resp2)}")
+                        if pb_resp2 and "?" not in pb_resp2:
+                            sp_resp2 = await self.connection.send_command("ATSPB")
+                            logger.info(f"  AT SP B -> {repr(sp_resp2)}")
+                            if sp_resp2 and "?" not in sp_resp2:
+                                ms_can_ok = True
+                                logger.info("  MS-CAN via ATPB C004 (channel 1 fallback)")
                 
                 if ms_can_ok:
                     # Enable headers for address identification
@@ -637,12 +657,10 @@ class OBDProtocol:
         finally:
             # Restore to HS-CAN (Protocol 6) and default settings
             try:
-                # Switch CAN transceiver back to primary (pins 6+14) if STN device
-                try:
-                    await self.connection.send_command("STCANSW0")
-                except Exception:
+                # Switch CAN transceiver back to primary (pins 6+14)
+                for cmd in ["STPC1", "STPC 1", "STCANSW0", "STCANSW 0"]:
                     try:
-                        await self.connection.send_command("STCANSW 0")
+                        await self.connection.send_command(cmd)
                     except Exception:
                         pass
                 await self.connection.send_command("ATSP6")   # Back to ISO 15765-4 CAN 500k
