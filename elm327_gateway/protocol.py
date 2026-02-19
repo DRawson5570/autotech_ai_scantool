@@ -351,98 +351,158 @@ class OBDProtocol:
     
     async def discover_modules(self) -> List[ECUModule]:
         """
-        Discover all ECU modules on the CAN bus by broadcasting
-        PID-supported request (0100) with headers enabled.
+        Discover all ECU modules on the CAN bus by probing each of the
+        8 standard OBD-II addresses individually.
         
-        Every ECU that supports Mode 01 will respond from its
-        unique CAN address (7E8=PCM, 7E9=TCM, 7EA=ABS, etc.).
+        Strategy:
+        1. Probe each address 7E0-7E7 with UDS TesterPresent (3E 00)
+           — works for ABS, SRS, BCM, HVAC, etc. that don't support Mode 01
+        2. Also try Mode 01 PID 00 (0100) for OBD-II emission modules
+        3. Any address that responds to either is a live module
         
         Returns:
             List of ECUModule objects for each responding module
         """
         modules = []
+        seen_addrs = set()
         
         try:
-            # Enable headers and spaces so we can see which address replied
+            # Enable headers so we can confirm response source
             await self.connection.send_command("ATH1")
             await self.connection.send_command("ATS1")
             
-            # Set timeout to max so slow modules have time to respond
-            # ATSTFF = 255 * 4ms = ~1 second (ELM327 v1.3+)
+            # Set timeout high for slow modules (ATSTFF = 255 * 4ms ≈ 1s)
             try:
                 await self.connection.send_command("ATSTFF")
             except Exception:
-                # Older adapters may not support ATSTFF; use AT ST FF
                 try:
                     await self.connection.send_command("AT ST FF")
                 except Exception:
                     logger.debug("Could not set extended timeout")
             
-            # Broadcast Mode 01 PID 00 — every OBD-II ECU must support this
+            # --- Phase 1: Broadcast Mode 01 PID 00 ---
+            # Fast: catches all emission-related modules (PCM, sometimes TCM)
             response = await self.connection.send_command("0100", timeout=5.0)
-            logger.info(f"Module discovery raw response: {repr(response)}")
+            logger.info(f"Module discovery broadcast response: {repr(response)}")
             
-            if not response or "NO DATA" in response.upper() or "ERROR" in response.upper():
-                return modules
+            if response and "NO DATA" not in response.upper() and "ERROR" not in response.upper():
+                self._parse_module_response(response, seen_addrs, modules)
             
-            # Parse response lines — each ECU responds on its own line
-            # Format: "7E8 06 41 00 BE 3F A8 13"
-            seen_addrs = set()
-            for line in response.split('\n'):
-                line = line.strip()
-                if not line:
-                    continue
-                
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                
-                # First token should be a 3-char CAN address (e.g. 7E8)
-                addr_str = parts[0].upper()
-                if len(addr_str) != 3:
-                    continue
-                try:
-                    resp_addr = int(addr_str, 16)
-                except ValueError:
-                    continue
-                
-                # Only count standard OBD-II response range (7E8-7EF)
-                if resp_addr < 0x7E8 or resp_addr > 0x7EF:
-                    continue
-                
+            # --- Phase 2: Probe each address with UDS TesterPresent ---
+            # Catches non-emission modules (ABS, SRS, BCM, HVAC, etc.)
+            for req_addr in range(0x7E0, 0x7E8):
+                resp_addr = req_addr + 8  # 7E0→7E8, 7E1→7E9, etc.
                 if resp_addr in seen_addrs:
-                    continue
-                seen_addrs.add(resp_addr)
+                    continue  # Already found via broadcast
                 
-                # Look up module info
-                info = ECU_ADDRESSES.get(resp_addr, {
-                    "request": resp_addr - 8,
-                    "name": f"ECU-{addr_str}",
-                    "description": f"Unknown Module ({addr_str})"
-                })
-                
-                module = ECUModule(
-                    response_addr=resp_addr,
-                    request_addr=info["request"],
-                    name=info["name"],
-                    description=info["description"],
-                )
-                modules.append(module)
-                logger.info(f"Discovered module: {info['name']} ({addr_str})")
+                try:
+                    # Target this specific address
+                    await self.connection.send_command(f"ATSH{req_addr:03X}")
+                    
+                    # Send UDS TesterPresent (service 0x3E, sub-function 0x00)
+                    # Positive response = 7E 00
+                    tp_response = await self.connection.send_command("3E00", timeout=2.0)
+                    logger.debug(f"TesterPresent to {req_addr:03X}: {repr(tp_response)}")
+                    
+                    if tp_response and "NO DATA" not in tp_response.upper() and "ERROR" not in tp_response.upper():
+                        # Got a response — module is alive
+                        # Check for positive response (7E) or any non-error
+                        if "7E" in tp_response.upper():
+                            info = ECU_ADDRESSES.get(resp_addr, {
+                                "request": req_addr,
+                                "name": f"ECU-{resp_addr:03X}",
+                                "description": f"Module at {resp_addr:03X}"
+                            })
+                            module = ECUModule(
+                                response_addr=resp_addr,
+                                request_addr=req_addr,
+                                name=info["name"],
+                                description=info["description"],
+                            )
+                            modules.append(module)
+                            seen_addrs.add(resp_addr)
+                            logger.info(f"Discovered module via TesterPresent: {info['name']} ({resp_addr:03X})")
+                            continue
+                    
+                    # Phase 2b: Try Mode 01 PID 00 targeted (some modules
+                    # respond to targeted but not broadcast)
+                    obd_response = await self.connection.send_command("0100", timeout=2.0)
+                    logger.debug(f"Targeted 0100 to {req_addr:03X}: {repr(obd_response)}")
+                    
+                    if obd_response and "NO DATA" not in obd_response.upper() and "ERROR" not in obd_response.upper():
+                        if "41 00" in obd_response or "4100" in obd_response:
+                            info = ECU_ADDRESSES.get(resp_addr, {
+                                "request": req_addr,
+                                "name": f"ECU-{resp_addr:03X}",
+                                "description": f"Module at {resp_addr:03X}"
+                            })
+                            module = ECUModule(
+                                response_addr=resp_addr,
+                                request_addr=req_addr,
+                                name=info["name"],
+                                description=info["description"],
+                            )
+                            modules.append(module)
+                            seen_addrs.add(resp_addr)
+                            logger.info(f"Discovered module via targeted 0100: {info['name']} ({resp_addr:03X})")
+                    
+                except Exception as e:
+                    logger.debug(f"No response from {req_addr:03X}: {e}")
             
         except Exception as e:
             logger.error(f"Module discovery failed: {e}")
         finally:
             # Restore settings
             try:
+                await self.connection.send_command("ATSH7DF")  # Reset to broadcast
                 await self.connection.send_command("ATH0")
                 await self.connection.send_command("ATS0")
-                # Reset timeout to default
-                await self.connection.send_command("ATST32")
+                await self.connection.send_command("ATST32")   # Reset timeout
             except Exception as e:
                 logger.warning(f"Failed to restore AT settings: {e}")
         
+        # Sort by response address for consistent ordering
+        modules.sort(key=lambda m: m.response_addr)
         return modules
+    
+    def _parse_module_response(self, response: str, seen_addrs: set, modules: list):
+        """Parse a header-on response to extract responding CAN addresses."""
+        for line in response.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            
+            addr_str = parts[0].upper()
+            if len(addr_str) != 3:
+                continue
+            try:
+                resp_addr = int(addr_str, 16)
+            except ValueError:
+                continue
+            
+            if resp_addr < 0x7E8 or resp_addr > 0x7EF:
+                continue
+            if resp_addr in seen_addrs:
+                continue
+            
+            seen_addrs.add(resp_addr)
+            info = ECU_ADDRESSES.get(resp_addr, {
+                "request": resp_addr - 8,
+                "name": f"ECU-{addr_str}",
+                "description": f"Unknown Module ({addr_str})"
+            })
+            module = ECUModule(
+                response_addr=resp_addr,
+                request_addr=info["request"],
+                name=info["name"],
+                description=info["description"],
+            )
+            modules.append(module)
+            logger.info(f"Discovered module via broadcast: {info['name']} ({addr_str})")
     
     async def get_module_supported_pids(self, request_addr: int) -> List[int]:
         """
@@ -505,7 +565,8 @@ class OBDProtocol:
     async def scan_all_modules(self) -> List[ECUModule]:
         """
         Full module scan: discover all ECUs and enumerate each one's
-        supported PIDs.
+        supported PIDs. For modules that don't support Mode 01, reports
+        them as present with UDS-only capability.
         
         Returns:
             List of ECUModule objects with supported_pids populated
@@ -516,7 +577,7 @@ class OBDProtocol:
         modules = await self.discover_modules()
         logger.info(f"Found {len(modules)} module(s), enumerating PIDs...")
         
-        # Step 2: For each module, get its supported PIDs
+        # Step 2: For each module, try to get its supported PIDs
         for module in modules:
             pids = await self.get_module_supported_pids(module.request_addr)
             # Filter out bitmap PIDs (0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0)
@@ -531,10 +592,17 @@ class OBDProtocol:
                 else:
                     module.pid_names.append(f"PID_0x{pid:02X}")
             
-            logger.info(
-                f"Module {module.name} ({module.request_addr:03X}): "
-                f"{len(module.supported_pids)} PIDs"
-            )
+            if module.supported_pids:
+                logger.info(
+                    f"Module {module.name} ({module.request_addr:03X}): "
+                    f"{len(module.supported_pids)} Mode 01 PIDs"
+                )
+            else:
+                # Module responds to UDS but not Mode 01 — still valid
+                logger.info(
+                    f"Module {module.name} ({module.request_addr:03X}): "
+                    f"UDS-only (no Mode 01 PIDs)"
+                )
         
         return modules
     
