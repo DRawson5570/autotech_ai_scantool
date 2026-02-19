@@ -113,6 +113,18 @@ FORD_MS_CAN_ADDRESSES = {
 }
 
 
+# Standard UDS DIDs (Data Identifiers) for module identification
+STANDARD_DIDS = {
+    0xF187: "Part Number",
+    0xF188: "ECU Software Number",
+    0xF189: "Software Version",
+    0xF18C: "ECU Serial Number",
+    0xF190: "VIN",
+    0xF191: "ECU Hardware Number",
+    0xF1A0: "Supplier ID",
+}
+
+
 @dataclass
 class ECUModule:
     """Represents a discovered ECU module on the CAN bus."""
@@ -123,6 +135,7 @@ class ECUModule:
     supported_pids: List[int] = field(default_factory=list)
     pid_names: List[str] = field(default_factory=list)
     bus: str = "HS-CAN"         # "HS-CAN" (500 kbps) or "MS-CAN" (125 kbps)
+    module_info: Dict[str, str] = field(default_factory=dict)  # UDS DID data
 
 
 class OBDProtocol:
@@ -616,6 +629,23 @@ class OBDProtocol:
                     
                     logger.info(f"Phase 3 complete: found {ms_can_found} MS-CAN module(s)")
                     
+                    # Read UDS DIDs for each discovered MS-CAN module
+                    # (must do this while still on MS-CAN bus)
+                    for mod in modules:
+                        if mod.bus != "MS-CAN":
+                            continue
+                        try:
+                            logger.info(f"  Reading DIDs for {mod.name} ({mod.request_addr:03X})...")
+                            await self.connection.send_command(f"ATSH{mod.request_addr:03X}")
+                            await self.connection.send_command(f"ATCRA{mod.response_addr:03X}")
+                            mod.module_info = await self._read_module_dids(mod)
+                            if mod.module_info:
+                                logger.info(f"  {mod.name}: {len(mod.module_info)} DID(s) read")
+                            else:
+                                logger.info(f"  {mod.name}: no DIDs readable")
+                        except Exception as e:
+                            logger.debug(f"  {mod.name} DID read failed: {e}")
+                    
                     # Reset CAN receive filter
                     try:
                         await self.connection.send_command("ATCRA")
@@ -705,6 +735,74 @@ class OBDProtocol:
                 return False
         return True
     
+    async def _read_module_dids(self, module: 'ECUModule') -> Dict[str, str]:
+        """
+        Read standard UDS DIDs (Data Identifiers) from a module.
+        
+        Uses UDS Service 0x22 (ReadDataByIdentifier) to read
+        part numbers, software versions, VIN, etc.
+        
+        IMPORTANT: Caller must have already set ATSH and ATCRA
+        for this module, and be on the correct bus.
+        
+        Args:
+            module: The ECUModule to read from
+            
+        Returns:
+            Dict mapping DID name to string value
+        """
+        info = {}
+        
+        for did, label in STANDARD_DIDS.items():
+            try:
+                # UDS Service 0x22: ReadDataByIdentifier
+                cmd = f"22{did:04X}"
+                resp = await self.connection.send_command(cmd, timeout=3.0)
+                
+                if not resp or not self._is_live_response(resp):
+                    continue
+                
+                # Positive response: 62 XX XX <data>
+                # Strip any CAN header (e.g. "7E8 06 62 F1 90 ..." or "62 F1 90 ...")
+                cleaned = resp.replace(' ', '').upper()
+                
+                # Find "62" + DID in response
+                did_hex = f"{did:04X}"
+                marker = f"62{did_hex}"
+                idx = cleaned.find(marker)
+                
+                if idx < 0:
+                    continue
+                
+                # Data starts after 62+DID (6 hex chars)
+                data_hex = cleaned[idx + len(marker):]
+                
+                if not data_hex:
+                    continue
+                
+                # Try decoding as ASCII text (most F1xx DIDs are text)
+                try:
+                    data_bytes = bytes.fromhex(data_hex)
+                    # Filter to printable ASCII
+                    text = ''.join(
+                        chr(b) if 32 <= b < 127 else '' 
+                        for b in data_bytes
+                    ).strip()
+                    if text:
+                        info[label] = text
+                    else:
+                        # Show as hex if not printable
+                        info[label] = data_hex
+                except ValueError:
+                    info[label] = data_hex
+                    
+                logger.info(f"  DID {did_hex} ({label}): {info.get(label, 'N/A')}")
+                
+            except Exception as e:
+                logger.debug(f"  DID {did:04X} read failed: {e}")
+        
+        return info
+
     async def get_module_supported_pids(self, request_addr: int) -> List[int]:
         """
         Enumerate all supported Mode 01 PIDs for a specific ECU module.
@@ -804,6 +902,16 @@ class OBDProtocol:
                     f"Module {module.name} ({module.request_addr:03X}): "
                     f"UDS-only (no Mode 01 PIDs)"
                 )
+                # Read DIDs for HS-CAN UDS-only modules (MS-CAN already done in Phase 3)
+                if module.bus == "HS-CAN" and not module.module_info:
+                    try:
+                        await self.connection.send_command(f"ATSH{module.request_addr:03X}")
+                        await self.connection.send_command(f"ATCRA{module.response_addr:03X}")
+                        module.module_info = await self._read_module_dids(module)
+                        await self.connection.send_command("ATSH7DF")
+                        await self.connection.send_command("ATCRA")
+                    except Exception as e:
+                        logger.debug(f"  {module.name} DID read failed: {e}")
         
         return modules
     
