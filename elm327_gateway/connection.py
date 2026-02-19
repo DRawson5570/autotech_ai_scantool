@@ -121,7 +121,8 @@ class ELM327Connection(ABC):
         
         # Remove echo if present (command echoed back)
         lines = [l.strip() for l in response.split('\n') if l.strip()]
-        if lines and not lines[0].startswith('4'):  # OBD responses start with 4x
+        if lines and not lines[0].startswith('4') and not lines[0].startswith('7E'):
+            # OBD responses start with 4x (no headers) or 7Ex (with CAN headers)
             lines = lines[1:]  # Remove echo
         
         return '\n'.join(lines)
