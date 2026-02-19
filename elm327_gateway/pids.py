@@ -628,6 +628,225 @@ register_pid(
 )
 
 # -----------------------------------------------------------------------------
+# Status / Metadata PIDs
+# -----------------------------------------------------------------------------
+
+register_pid(
+    pid=0x01,
+    name="MONITOR_STATUS",
+    description="Monitor Status Since DTCs Cleared (MIL, DTC count, readiness)",
+    num_bytes=4,
+    unit="",
+    min_val=0,
+    max_val=0,
+    formula=lambda d: (d[0] * 16777216) + (d[1] * 65536) + (d[2] * 256) + d[3],
+    category=PIDCategory.ENGINE,
+    aliases=["MIL_STATUS", "DTC_STATUS"]
+)
+
+register_pid(
+    pid=0x13,
+    name="O2_SENSORS_PRESENT",
+    description="Oxygen Sensors Present (2 banks)",
+    num_bytes=1,
+    unit="",
+    min_val=0,
+    max_val=255,
+    formula=lambda d: d[0],
+    category=PIDCategory.OXYGEN
+)
+
+register_pid(
+    pid=0x1C,
+    name="OBD_STANDARD",
+    description="OBD Standards This Vehicle Conforms To",
+    num_bytes=1,
+    unit="",
+    min_val=0,
+    max_val=255,
+    formula=lambda d: d[0],
+    category=PIDCategory.VEHICLE_INFO,
+    aliases=["OBD_COMPLIANCE"]
+)
+
+register_pid(
+    pid=0x41,
+    name="MONITOR_STATUS_DRIVE",
+    description="Monitor Status This Drive Cycle",
+    num_bytes=4,
+    unit="",
+    min_val=0,
+    max_val=0,
+    formula=lambda d: (d[0] * 16777216) + (d[1] * 65536) + (d[2] * 256) + d[3],
+    category=PIDCategory.ENGINE,
+    aliases=["DRIVE_MONITOR"]
+)
+
+register_pid(
+    pid=0x51,
+    name="FUEL_TYPE",
+    description="Fuel Type (gasoline, diesel, hybrid, etc.)",
+    num_bytes=1,
+    unit="",
+    min_val=0,
+    max_val=255,
+    formula=lambda d: d[0],
+    category=PIDCategory.FUEL
+)
+
+# -----------------------------------------------------------------------------
+# Throttle / Pedal PIDs
+# -----------------------------------------------------------------------------
+
+register_pid(
+    pid=0x45,
+    name="REL_THROTTLE_POS",
+    description="Relative Throttle Position",
+    num_bytes=1,
+    unit="%",
+    min_val=0,
+    max_val=100,
+    formula=lambda d: d[0] * 100 / 255,
+    category=PIDCategory.ENGINE,
+    aliases=["RELATIVE_THROTTLE"]
+)
+
+register_pid(
+    pid=0x47,
+    name="ABS_THROTTLE_B",
+    description="Absolute Throttle Position B",
+    num_bytes=1,
+    unit="%",
+    min_val=0,
+    max_val=100,
+    formula=lambda d: d[0] * 100 / 255,
+    category=PIDCategory.ENGINE,
+    aliases=["THROTTLE_POS_B"]
+)
+
+register_pid(
+    pid=0x49,
+    name="ACCEL_POS_D",
+    description="Accelerator Pedal Position D",
+    num_bytes=1,
+    unit="%",
+    min_val=0,
+    max_val=100,
+    formula=lambda d: d[0] * 100 / 255,
+    category=PIDCategory.ENGINE,
+    aliases=["PEDAL_D", "APP_D"]
+)
+
+register_pid(
+    pid=0x4A,
+    name="ACCEL_POS_E",
+    description="Accelerator Pedal Position E",
+    num_bytes=1,
+    unit="%",
+    min_val=0,
+    max_val=100,
+    formula=lambda d: d[0] * 100 / 255,
+    category=PIDCategory.ENGINE,
+    aliases=["PEDAL_E", "APP_E"]
+)
+
+register_pid(
+    pid=0x4C,
+    name="CMD_THROTTLE",
+    description="Commanded Throttle Actuator",
+    num_bytes=1,
+    unit="%",
+    min_val=0,
+    max_val=100,
+    formula=lambda d: d[0] * 100 / 255,
+    category=PIDCategory.ENGINE,
+    aliases=["COMMANDED_THROTTLE"]
+)
+
+# -----------------------------------------------------------------------------
+# EGR / Emissions PIDs
+# -----------------------------------------------------------------------------
+
+register_pid(
+    pid=0x2C,
+    name="CMD_EGR",
+    description="Commanded EGR",
+    num_bytes=1,
+    unit="%",
+    min_val=0,
+    max_val=100,
+    formula=lambda d: d[0] * 100 / 255,
+    category=PIDCategory.EMISSIONS,
+    aliases=["EGR", "COMMANDED_EGR"]
+)
+
+register_pid(
+    pid=0x30,
+    name="WARMUPS_CLR",
+    description="Warm-ups Since Codes Cleared",
+    num_bytes=1,
+    unit="count",
+    min_val=0,
+    max_val=255,
+    formula=lambda d: d[0],
+    category=PIDCategory.EMISSIONS,
+    aliases=["WARMUPS_SINCE_CLEAR"]
+)
+
+register_pid(
+    pid=0x44,
+    name="CMD_EQUIV_RATIO",
+    description="Fuel-Air Commanded Equivalence Ratio",
+    num_bytes=2,
+    unit="lambda",
+    min_val=0,
+    max_val=2,
+    formula=lambda d: ((d[0] * 256) + d[1]) * 2 / 65536,
+    category=PIDCategory.FUEL,
+    aliases=["LAMBDA", "EQUIV_RATIO"]
+)
+
+# Wide-band O2 with current (Mode $06 style)
+register_pid(
+    pid=0x34,
+    name="O2_B1S1_WR",
+    description="O2 Sensor 1 - Fuel-Air Equiv. Ratio & Current",
+    num_bytes=4,
+    unit="lambda",
+    min_val=0,
+    max_val=2,
+    formula=lambda d: ((d[0] * 256) + d[1]) * 2 / 65536,
+    category=PIDCategory.OXYGEN,
+    aliases=["WIDEBAND_O2_B1S1"]
+)
+
+# Supported PIDs bitmaps (0x00, 0x20, 0x40 — metadata, not real data)
+# We register them so they get names but they're system PIDs
+register_pid(
+    pid=0x20,
+    name="PIDS_SUPPORTED_21_40",
+    description="PIDs Supported [21-40] (bitmap)",
+    num_bytes=4,
+    unit="",
+    min_val=0,
+    max_val=0,
+    formula=lambda d: (d[0] * 16777216) + (d[1] * 65536) + (d[2] * 256) + d[3],
+    category=PIDCategory.VEHICLE_INFO
+)
+
+register_pid(
+    pid=0x40,
+    name="PIDS_SUPPORTED_41_60",
+    description="PIDs Supported [41-60] (bitmap)",
+    num_bytes=4,
+    unit="",
+    min_val=0,
+    max_val=0,
+    formula=lambda d: (d[0] * 16777216) + (d[1] * 65536) + (d[2] * 256) + d[3],
+    category=PIDCategory.VEHICLE_INFO
+)
+
+# -----------------------------------------------------------------------------
 # Helper Functions
 # -----------------------------------------------------------------------------
 

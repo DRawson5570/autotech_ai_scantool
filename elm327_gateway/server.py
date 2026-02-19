@@ -517,6 +517,11 @@ async def get_supported_pids_list():
     try:
         supported = await _elm.get_supported_pids()
         
+        # PID bitmaps (0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0) are
+        # "supported PIDs" queries, not real data. Filter them out.
+        BITMAP_PIDS = {0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0}
+        supported = [p for p in supported if p not in BITMAP_PIDS]
+        
         # Resolve PID numbers to names
         from elm327_gateway.pids import PIDRegistry
         pid_names = []
