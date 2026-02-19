@@ -113,6 +113,26 @@ class GatewayTunnel:
         except Exception as e:
             return {"status": 500, "body": {"detail": str(e)}}
     
+    async def _handle_request_background(self, request_id: str, method: str, path: str, body: dict):
+        """Handle a forwarded request in a background task (non-blocking)."""
+        try:
+            result = await self._forward_to_local(method, path, body)
+
+            response = {
+                "type": "response",
+                "id": request_id,
+                "status": result["status"],
+                "body": result["body"],
+            }
+
+            if self._ws and not self._ws.closed:
+                await self._ws.send_str(json.dumps(response))
+                logger.info(f"→ Response {request_id}: {result['status']}")
+            else:
+                logger.warning(f"Cannot send response {request_id}: WebSocket closed")
+        except Exception as e:
+            logger.error(f"Background request {request_id} failed: {e}")
+
     async def _handle_message(self, msg_data: str):
         """Handle an incoming message from the server."""
         try:
@@ -130,22 +150,13 @@ class GatewayTunnel:
             path = msg.get("path", "/")
             body = msg.get("body")
             
-            logger.info(f"<-- Request {request_id}: {method} {path}")
+            logger.info(f"← Request {request_id}: {method} {path}")
             
-            # Forward to local gateway
-            result = await self._forward_to_local(method, path, body)
-            
-            # Send response back to server
-            response = {
-                "type": "response",
-                "id": request_id,
-                "status": result["status"],
-                "body": result["body"],
-            }
-            
-            if self._ws and not self._ws.closed:
-                await self._ws.send_str(json.dumps(response))
-                logger.info(f"--> Response {request_id}: {result['status']}")
+            # Run in background so the message loop keeps processing
+            # pings/heartbeats while long operations (module scan) run
+            asyncio.create_task(
+                self._handle_request_background(request_id, method, path, body)
+            )
         
         elif msg_type == "ping":
             # Server keepalive
@@ -173,7 +184,7 @@ class GatewayTunnel:
             
             self._ws = await session.ws_connect(
                 self.ws_url,
-                heartbeat=30,
+                heartbeat=60,
                 timeout=aiohttp.ClientTimeout(total=30),
             )
             
