@@ -1439,6 +1439,13 @@ class OBDProtocol:
             # Strip the OBD response header (43/47/4A)
             if cleaned.startswith(expected_header):
                 cleaned = cleaned[2:]
+                # On CAN (ISO 15765-4), first byte after SID is the DTC count — skip it
+                # Without this, the count byte gets merged with the first DTC byte,
+                # e.g. count=01 + DTC 12 89 → "0112" parsed as P0112 instead of P1289
+                if ecu_addr and len(cleaned) >= 2:
+                    dtc_count_byte = cleaned[:2]
+                    cleaned = cleaned[2:]
+                    logger.debug(f"CAN DTC count byte: {dtc_count_byte} (skipped)")
             else:
                 continue  # Not a DTC response line
             
