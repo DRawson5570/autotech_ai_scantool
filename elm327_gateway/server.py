@@ -455,17 +455,54 @@ async def connect(req: ConnectRequest):
     global _elm, _connected_at
     
     try:
-        # If already connected, skip reconnection
+        # If already connected, verify the link is alive and check for vehicle swap
         if _elm and _elm.connected:
-            vin = _elm.vin
-            supported = await _elm.get_supported_pids()
-            logger.info(f"Already connected, skipping reconnection (VIN: {vin})")
-            return {
-                "status": "connected",
-                "vin": vin,
-                "supported_pids": len(supported),
-                "address": req.address
-            }
+            old_vin = _elm.vin
+            
+            # 1. Test the connection with a quick AT command
+            link_alive = False
+            try:
+                resp = await _elm._connection.send_command("ATRV", timeout=3.0)
+                if resp:
+                    link_alive = True
+            except Exception as e:
+                logger.warning(f"Connection test failed: {e}")
+            
+            if link_alive:
+                # 2. Re-read VIN to detect vehicle swap
+                new_vin = None
+                try:
+                    new_vin = await _elm.read_vin()
+                except Exception:
+                    pass
+                
+                if new_vin and old_vin and new_vin == old_vin:
+                    # Same vehicle, same link — nothing to do
+                    supported = await _elm.get_supported_pids()
+                    logger.info(f"Already connected to same vehicle (VIN: {old_vin})")
+                    return {
+                        "status": "connected",
+                        "vin": old_vin,
+                        "supported_pids": len(supported),
+                        "address": req.address
+                    }
+                else:
+                    # VIN changed (or couldn't read it) — vehicle swapped
+                    logger.info(
+                        f"Vehicle swap detected: {old_vin} → {new_vin}. "
+                        f"Re-initializing..."
+                    )
+            else:
+                logger.info("Connection dead. Reconnecting...")
+            
+            # Disconnect stale connection before reconnecting
+            _stop_keepalive()
+            try:
+                await _elm.disconnect()
+            except Exception:
+                pass
+            _elm = None
+            _connected_at = None
         
         _elm = ELM327Service()
         success = await _elm.connect(req.connection_type, req.address)
