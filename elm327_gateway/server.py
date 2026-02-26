@@ -21,6 +21,7 @@ import asyncio
 import logging
 import platform
 import socket
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -44,9 +45,73 @@ logger = logging.getLogger(__name__)
 # Global ELM327 service instance
 _elm: Optional[ELM327Service] = None
 _connected_at: Optional[datetime] = None
+_keepalive_task: Optional[asyncio.Task] = None
+
+# Keepalive settings
+KEEPALIVE_INTERVAL = 25  # seconds between pings
+KEEPALIVE_IDLE_THRESHOLD = 15  # only ping if idle for this many seconds
 
 # mDNS/Bonjour service for auto-discovery
 _mdns_service = None
+
+
+async def _keepalive_loop():
+    """
+    Background task that pings the ELM327 adapter to prevent idle disconnects.
+    
+    Sends ATRV (read voltage) every KEEPALIVE_INTERVAL seconds, but only
+    when the connection has been idle for KEEPALIVE_IDLE_THRESHOLD seconds.
+    ATRV is lightweight and harmless — it just reads battery voltage.
+    The connection lock prevents collisions with real commands.
+    """
+    logger.info(f"Keepalive started (interval={KEEPALIVE_INTERVAL}s, idle_threshold={KEEPALIVE_IDLE_THRESHOLD}s)")
+    try:
+        while True:
+            await asyncio.sleep(KEEPALIVE_INTERVAL)
+            
+            if not _elm or not _elm.connected:
+                logger.debug("Keepalive: not connected, stopping")
+                break
+            
+            # Check if the connection has been idle long enough
+            conn = _elm._connection
+            if conn and conn._last_activity:
+                idle_time = time.monotonic() - conn._last_activity
+                if idle_time < KEEPALIVE_IDLE_THRESHOLD:
+                    logger.debug(f"Keepalive: skip (idle {idle_time:.0f}s < {KEEPALIVE_IDLE_THRESHOLD}s)")
+                    continue
+            
+            # Send keepalive command (ATRV = read voltage, fast and harmless)
+            try:
+                response = await conn.send_command("ATRV", timeout=3.0)
+                logger.debug(f"Keepalive ping OK: {response.strip()}")
+            except ConnectionError:
+                logger.warning("Keepalive: connection lost")
+                break
+            except asyncio.TimeoutError:
+                logger.warning("Keepalive: timeout (adapter may be unresponsive)")
+            except Exception as e:
+                logger.warning(f"Keepalive: error: {e}")
+    except asyncio.CancelledError:
+        logger.info("Keepalive task cancelled")
+    except Exception as e:
+        logger.error(f"Keepalive loop crashed: {e}", exc_info=True)
+    logger.info("Keepalive stopped")
+
+
+def _start_keepalive():
+    """Start the keepalive background task."""
+    global _keepalive_task
+    _stop_keepalive()  # Cancel any existing task
+    _keepalive_task = asyncio.create_task(_keepalive_loop())
+
+
+def _stop_keepalive():
+    """Stop the keepalive background task."""
+    global _keepalive_task
+    if _keepalive_task and not _keepalive_task.done():
+        _keepalive_task.cancel()
+    _keepalive_task = None
 
 
 def get_local_ip():
@@ -170,6 +235,7 @@ async def lifespan(app: FastAPI):
     yield
     # Cleanup on shutdown
     global _elm
+    _stop_keepalive()
     stop_mdns_service()
     if _elm and _elm.connected:
         await _elm.disconnect()
@@ -426,6 +492,7 @@ async def connect(req: ConnectRequest):
         
         if success:
             _connected_at = datetime.now()
+            _start_keepalive()
             supported = await _elm.get_supported_pids()
             return {
                 "status": "connected",
@@ -445,6 +512,8 @@ async def connect(req: ConnectRequest):
 async def disconnect():
     """Disconnect from ELM327."""
     global _elm, _connected_at
+    
+    _stop_keepalive()
     
     if _elm:
         await _elm.disconnect()

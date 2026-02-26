@@ -11,6 +11,7 @@ Connection Types:
 
 import asyncio
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -50,6 +51,8 @@ class ELM327Connection(ABC):
         self._connected = False
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
+        self._lock = asyncio.Lock()
+        self._last_activity: float = 0.0  # monotonic timestamp of last command
     
     @property
     def connected(self) -> bool:
@@ -76,23 +79,26 @@ class ELM327Connection(ABC):
         Returns:
             Response string with prompt removed
         """
-        if not self._connected or not self._writer:
-            raise ConnectionError("Not connected to ELM327")
-        
-        timeout = timeout or self.config.timeout
-        
-        # Send command with carriage return
-        cmd_bytes = f"{command}\r".encode('ascii')
-        self._writer.write(cmd_bytes)
-        await self._writer.drain()
-        
-        logger.debug(f"Sent: {command}")
-        
-        # Read response until prompt (>)
-        response = await self._read_until_prompt(timeout)
-        logger.debug(f"Received: {response}")
-        
-        return response
+        async with self._lock:
+            if not self._connected or not self._writer:
+                raise ConnectionError("Not connected to ELM327")
+            
+            timeout = timeout or self.config.timeout
+            
+            # Send command with carriage return
+            cmd_bytes = f"{command}\r".encode('ascii')
+            self._writer.write(cmd_bytes)
+            await self._writer.drain()
+            
+            logger.debug(f"Sent: {command}")
+            
+            # Read response until prompt (>)
+            response = await self._read_until_prompt(timeout)
+            logger.debug(f"Received: {response}")
+            
+            self._last_activity = time.monotonic()
+            
+            return response
     
     async def _read_until_prompt(self, timeout: float) -> str:
         """Read response until ELM327 prompt (>)."""
