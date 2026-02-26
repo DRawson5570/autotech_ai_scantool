@@ -371,43 +371,43 @@ def _vin_to_key(vin: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# VIN Cache
+# VIN Lookups — permanent storage of decoded VINs
 # ---------------------------------------------------------------------------
 
-def _check_vin_cache(vin: str) -> Optional[Dict[str, str]]:
-    """Return cached decode result, or None."""
+def _check_vin_lookup(vin: str) -> Optional[Dict[str, str]]:
+    """Return a previously stored VIN decode result, or None."""
     db_path = _get_flat_db_path()
     if not db_path:
         return None
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
         row = conn.execute(
-            "SELECT result_json FROM vin_cache WHERE vin = ?", (vin,)
+            "SELECT result_json FROM vin_lookups WHERE vin = ?", (vin,)
         ).fetchone()
         conn.close()
         if row:
-            logger.debug(f"VIN cache hit for {vin[:6]}...")
+            logger.debug(f"VIN lookup found for {vin[:6]}...")
             return json.loads(row[0])
     except (sqlite3.Error, json.JSONDecodeError):
         pass
     return None
 
 
-def _save_vin_cache(vin: str, result: Dict[str, str]) -> None:
-    """Cache a VIN decode result for future lookups."""
+def _save_vin_lookup(vin: str, result: Dict[str, str], source: str = "nhtsa_api") -> None:
+    """Permanently store a VIN decode result for future lookups."""
     db_path = _get_flat_db_path()
     if not db_path:
         return
     try:
         conn = sqlite3.connect(db_path, timeout=5)
         conn.execute(
-            "INSERT OR REPLACE INTO vin_cache (vin, result_json) VALUES (?, ?)",
-            (vin, json.dumps(result, ensure_ascii=False))
+            "INSERT OR REPLACE INTO vin_lookups (vin, result_json, source) VALUES (?, ?, ?)",
+            (vin, json.dumps(result, ensure_ascii=False), source)
         )
         conn.commit()
         conn.close()
     except sqlite3.Error as e:
-        logger.debug(f"Failed to cache VIN result: {e}")
+        logger.debug(f"Failed to save VIN lookup: {e}")
 
 
 def decode_vin_vpic_offline(vin: str) -> Optional[Dict[str, str]]:
@@ -556,10 +556,10 @@ def decode_vin_full(vin: str, timeout: float = 3.0) -> Dict[str, str]:
             result["make"] = local_make
         return result
 
-    # --- Step 0: Check cache ---
-    cached = _check_vin_cache(vin)
-    if cached:
-        return cached
+    # --- Step 0: Check stored lookups (previously decoded VINs) ---
+    stored = _check_vin_lookup(vin)
+    if stored:
+        return stored
 
     # --- Step 1: Try offline flat DB decode ---
     vpic_result = decode_vin_vpic_offline(vin)
@@ -620,8 +620,9 @@ def decode_vin_full(vin: str, timeout: float = 3.0) -> Dict[str, str]:
         if parts:
             result["engine_desc"] = " ".join(parts)
 
-    # --- Cache the result for future lookups ---
+    # --- Save to vin_lookups for future lookups ---
     if len(result) > 2:  # more than just vin + make
-        _save_vin_cache(vin, result)
+        source = "offline" if not needs_api else "nhtsa_api"
+        _save_vin_lookup(vin, result, source)
 
     return result

@@ -1442,15 +1442,7 @@ class OBDProtocol:
                     if not data_hex:
                         continue
                     
-                    try:
-                        data_bytes = bytes.fromhex(data_hex)
-                        text = ''.join(
-                            chr(b) if 32 <= b < 127 else '' 
-                            for b in data_bytes
-                        ).strip()
-                        value = text if text else data_hex
-                    except ValueError:
-                        value = data_hex
+                    value = self._decode_did_value(data_hex)
                     
                     # Use known label or DID hex
                     label = STANDARD_DIDS.get(did, f"DID_{did_hex}")
