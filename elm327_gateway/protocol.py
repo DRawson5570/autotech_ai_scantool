@@ -1074,6 +1074,53 @@ class OBDProtocol:
         
         return info
     
+    @staticmethod
+    def _decode_did_value(data_bytes: bytes) -> str:
+        """Decode raw DID response bytes into a human-readable string.
+
+        Strategy:
+        1. Strip trailing null bytes (UDS strings are often null-terminated).
+        2. If ALL remaining bytes are printable ASCII (0x20-0x7E) and the
+           result looks like genuine text (contains alphanumeric chars),
+           return as decoded text.  Short strings (< 4 chars) must be
+           mostly alphanumeric to avoid garbage like "y~" or "),".
+        3. For binary data ≤ 4 bytes, show "0xHEX (decimal)".
+        4. For longer binary data, show space-separated hex bytes.
+        """
+        if not data_bytes:
+            return "(empty)"
+
+        # Strip trailing null bytes (common UDS string terminator)
+        trimmed = data_bytes.rstrip(b'\x00')
+        if not trimmed:
+            return "0x" + data_bytes.hex().upper()
+
+        # Check if every byte is printable ASCII
+        all_printable = all(0x20 <= b <= 0x7E for b in trimmed)
+
+        if all_printable:
+            text = trimmed.decode('ascii').strip()
+            has_alnum = any(c.isalnum() for c in text) if text else False
+
+            if text and has_alnum:
+                # Longer strings (>= 4 chars) — trust if they have alphanumeric
+                if len(text) >= 4:
+                    return text
+                # Short strings — only trust if mostly alphanumeric
+                stripped = text.replace('-', '').replace('.', '').replace(' ', '')
+                if stripped.isalnum():
+                    return text
+
+        # Binary data — format based on length (use original data_bytes)
+        if len(data_bytes) == 1:
+            return f"0x{data_bytes[0]:02X} ({data_bytes[0]})"
+        elif len(data_bytes) <= 4:
+            hex_str = data_bytes.hex().upper()
+            int_val = int.from_bytes(data_bytes, 'big')
+            return f"0x{hex_str} ({int_val})"
+        else:
+            return ' '.join(f'{b:02X}' for b in data_bytes)
+
     async def _scan_did_list(self, did_dict: Dict[int, str]) -> Dict[str, str]:
         """Read a list of DIDs and return those that respond positively.
         
@@ -1106,14 +1153,7 @@ class OBDProtocol:
                 
                 try:
                     data_bytes = bytes.fromhex(data_hex)
-                    text = ''.join(
-                        chr(b) if 32 <= b < 127 else '' 
-                        for b in data_bytes
-                    ).strip()
-                    if text:
-                        info[label] = text
-                    else:
-                        info[label] = data_hex
+                    info[label] = self._decode_did_value(data_bytes)
                 except ValueError:
                     info[label] = data_hex
                     
@@ -1211,14 +1251,10 @@ class OBDProtocol:
             if not data_hex:
                 return None
             
-            # Decode: try ASCII first, fall back to hex
+            # Decode response data intelligently
             try:
                 data_bytes = bytes.fromhex(data_hex)
-                text = ''.join(
-                    chr(b) if 32 <= b < 127 else '' 
-                    for b in data_bytes
-                ).strip()
-                result = text if text else data_hex
+                result = self._decode_did_value(data_bytes)
             except ValueError:
                 result = data_hex
             
