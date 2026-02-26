@@ -1448,8 +1448,12 @@ class OBDProtocol:
                     except ValueError:
                         value = data_hex
                     
-                    # Use known label or DID hex
-                    label = STANDARD_DIDS.get(did, f"DID_{did_hex}")
+                    # Use known label or DID hex — check all mapping sources
+                    label = (
+                        STANDARD_DIDS.get(did)
+                        or FORD_IDENTIFICATION_DIDS.get(did)
+                        or f"DID_{did_hex}"
+                    )
                     results[label] = value
                     logger.info(f"  DID {did_hex}: {value}")
                     
