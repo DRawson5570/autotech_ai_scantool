@@ -126,7 +126,34 @@ class GatewayApp:
                 self._tray.title = f"ELM327 Gateway - {msg}"
             except:
                 pass
-    
+
+    def _shutdown_for_update(self):
+        """Cleanly shut down before auto-update replaces the EXE.
+        
+        Stops the pystray icon first (releases its hidden HWND and
+        file handle on the EXE), then terminates.  Without this,
+        Windows keeps the EXE locked and the updater batch script's
+        copy/rename fails with "being used by another process".
+        """
+        logger.info("Shutting down for update...")
+        try:
+            if self._tray:
+                self._tray.stop()
+                import time; time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Tray stop failed (non-fatal): {e}")
+        try:
+            if self._tunnel:
+                # Best-effort tunnel cleanup
+                if self._loop and self._loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self._tunnel.stop(), self._loop
+                    )
+                    import time; time.sleep(0.5)
+        except Exception as e:
+            logger.debug(f"Tunnel stop failed (non-fatal): {e}")
+        os._exit(0)
+
     async def _detect_adapter(self) -> Optional[str]:
         """Auto-detect the ELM327 adapter port."""
         self._update_status("Scanning for ELM327...")
@@ -243,7 +270,7 @@ class GatewayApp:
             if should_restart:
                 self._update_status("[UPDATE] Restarting...")
                 await asyncio.sleep(2)
-                os._exit(0)
+                self._shutdown_for_update()
         except Exception as e:
             logger.warning(f"Startup update check failed: {e}")
         
@@ -261,7 +288,10 @@ class GatewayApp:
         
         # Periodic update check in background (every 6 hours)
         update_task = asyncio.create_task(
-            periodic_update_check(on_status=self._update_status)
+            periodic_update_check(
+                on_status=self._update_status,
+                on_exit=self._shutdown_for_update,
+            )
         )
         
         # Wait for all (they run forever)
@@ -321,7 +351,7 @@ class GatewayApp:
                     if result:
                         self._update_status("[UPDATE] Restarting...")
                         import time; time.sleep(2)
-                        os._exit(0)
+                        self._shutdown_for_update()
                     else:
                         self._update_status(f"Up to date (v{__version__})")
                 except Exception as e:

@@ -277,16 +277,21 @@ def apply_update_windows(new_exe_path: Path, current_exe_path: Path) -> bool:
 
     The batch script:
     1. Waits for the current process to exit (taskkill + timeout)
-    2. Replaces the old EXE with the new one
-    3. Starts the new EXE
-    4. Deletes itself
+    2. Waits 5s for Windows to release file handles (Defender, pystray, shell)
+    3. Renames old EXE to .old.exe (rename often succeeds when overwrite doesn't)
+    4. Copies new EXE into place, starts it
+    5. Retries up to 10 times with 3s delays if file is still locked
+    6. Deletes itself
 
     Returns True if the updater script was launched successfully.
     """
     pid = os.getpid()
     bat_path = current_exe_path.parent / "_gateway_updater.bat"
 
-    # Use short paths to avoid quoting issues
+    # Precompute path strings for the batch script
+    old_backup_name = f"{current_exe_path.stem}.old.exe"
+    old_backup_path = current_exe_path.parent / old_backup_name
+
     # NOTE: Paths may contain spaces and parentheses (e.g. "ELM327_Gateway (1).exe"
     # in Downloads). We avoid putting paths inside if() blocks because CMD treats
     # parentheses as block delimiters. Use goto-based flow instead.
@@ -301,34 +306,51 @@ if %ERRORLEVEL%==0 (
     goto wait_loop
 )
 echo Gateway process exited.
+REM Give Windows time to fully release file handles
+REM (Defender scan, pystray cleanup, shell cache, etc.)
+echo Waiting for file handles to release...
+timeout /t 5 /nobreak >NUL
 echo Replacing executable...
-REM Retry copy up to 5 times — Defender may temporarily lock the file
+REM Strategy: rename old EXE first (Windows often allows rename even
+REM when delete/overwrite is blocked), then copy new EXE in.
 set RETRIES=0
-:copy_retry
-copy /Y "{new_exe_path}" "{current_exe_path}"
-if %ERRORLEVEL% NEQ 0 (
+:rename_retry
+ren "{current_exe_path}" "{old_backup_name}" 2>NUL
+if exist "{current_exe_path}" (
     set /a RETRIES+=1
-    if %RETRIES% GEQ 5 goto :copy_failed
-    echo   Copy attempt %RETRIES% failed, retrying in 2s...
-    timeout /t 2 /nobreak >NUL
-    goto copy_retry
+    if %RETRIES% GEQ 10 goto :copy_failed
+    echo   Attempt %RETRIES%: file still locked, waiting 3s...
+    timeout /t 3 /nobreak >NUL
+    goto rename_retry
 )
+echo   Old version renamed. Copying new version...
+copy /Y "{new_exe_path}" "{current_exe_path}"
+if %ERRORLEVEL% NEQ 0 goto :copy_new_failed
 echo Update complete. Starting new version...
 start "" "{current_exe_path}"
 echo Cleaning up...
 del "{new_exe_path}" 2>NUL
+del "{old_backup_path}" 2>NUL
 (goto) 2>nul & del "%~f0"
+
+:copy_new_failed
+echo   Copy failed, restoring old version...
+ren "{old_backup_path}" "{current_exe_path.name}" 2>NUL
 
 :copy_failed
 echo.
-echo ERROR: Failed to replace executable after 5 attempts!
-echo Windows Defender may be blocking the file.
+echo ERROR: Failed to replace executable after %RETRIES% attempts!
+echo The file may still be locked by Windows Defender or another process.
 echo.
 echo The new version is saved at:
 echo   "{new_exe_path}"
 echo.
-echo To fix: Right-click the file above, Properties, Unblock,
-echo then manually rename it to {ASSET_NAME}.
+echo To update manually:
+echo   1. Close any running ELM327 Gateway in Task Manager
+echo   2. Wait 10 seconds
+echo   3. Delete the old "{current_exe_path.name}"
+echo   4. Rename "{new_exe_path.name}" to "{current_exe_path.name}"
+echo   5. Double-click to run
 pause
 exit /b 1
 '''
@@ -446,11 +468,16 @@ async def check_and_apply_update(on_status=None) -> bool:
         return False
 
 
-async def periodic_update_check(on_status=None):
+async def periodic_update_check(on_status=None, on_exit=None):
     """Background task that checks for updates periodically.
 
     If an update is found, it's applied and the process exits
     (the updater script will restart it).
+
+    Args:
+        on_status: Optional callback(message: str) for status updates.
+        on_exit: Optional callback to cleanly shut down (stop tray, etc.)
+                 before exiting. Falls back to os._exit(0) if not provided.
     """
     # Wait a bit after startup before first check
     await asyncio.sleep(60)
@@ -462,7 +489,10 @@ async def periodic_update_check(on_status=None):
                 logger.info("Update applied, exiting for restart...")
                 # Give the updater script time to start monitoring our PID
                 await asyncio.sleep(2)
-                os._exit(0)
+                if on_exit:
+                    on_exit()
+                else:
+                    os._exit(0)
         except Exception as e:
             logger.error(f"Periodic update check failed: {e}", exc_info=True)
 
