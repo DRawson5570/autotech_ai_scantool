@@ -39,6 +39,75 @@ ASSET_NAME = "ELM327_Gateway.exe"
 UPDATE_CHECK_INTERVAL = 6 * 60 * 60  # 6 hours
 
 
+def _strip_motw(file_path: Path) -> None:
+    """Remove the Mark of the Web (MOTW) from a downloaded file.
+
+    Windows stores MOTW as an NTFS Alternate Data Stream (ADS)
+    named 'Zone.Identifier'.  If present, SmartScreen will show
+    'Windows protected your PC' when the EXE is launched.
+
+    This uses the Win32 DeleteFile API to remove the ADS, which
+    works even when os.remove() doesn't support ADS paths.
+    """
+    try:
+        ads_path = str(file_path) + ":Zone.Identifier"
+        # Method 1: simple os.remove (works on most Windows versions)
+        try:
+            os.remove(ads_path)
+            logger.debug(f"Stripped MOTW via os.remove: {file_path.name}")
+            return
+        except (OSError, PermissionError):
+            pass
+
+        # Method 2: Win32 DeleteFileW (fallback)
+        try:
+            import ctypes
+            if ctypes.windll.kernel32.DeleteFileW(ads_path):
+                logger.debug(f"Stripped MOTW via DeleteFileW: {file_path.name}")
+                return
+        except Exception:
+            pass
+
+        # Method 3: PowerShell Unblock-File (last resort)
+        try:
+            subprocess.run(
+                ["powershell", "-Command", f'Unblock-File -Path "{file_path}"'],
+                capture_output=True, timeout=10,
+            )
+            logger.debug(f"Stripped MOTW via Unblock-File: {file_path.name}")
+        except Exception:
+            pass
+
+    except Exception as e:
+        # Non-fatal — the EXE may still work without stripping
+        logger.debug(f"MOTW strip failed (non-fatal): {e}")
+
+
+def _add_defender_exclusion(exe_dir: Path) -> None:
+    """Attempt to add the gateway directory to Windows Defender exclusions.
+
+    This requires admin privileges and will silently fail without them.
+    Should only be called once during initial setup (not every update).
+    """
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-Command",
+                f'Add-MpPreference -ExclusionPath "{exe_dir}"'
+            ],
+            capture_output=True, timeout=15,
+        )
+        if result.returncode == 0:
+            logger.info(f"Added Defender exclusion for {exe_dir}")
+        else:
+            logger.debug(
+                f"Defender exclusion failed (may need admin): "
+                f"{result.stderr.decode(errors='replace').strip()}"
+            )
+    except Exception as e:
+        logger.debug(f"Defender exclusion failed: {e}")
+
+
 def get_current_version() -> str:
     """Get the current gateway version."""
     try:
@@ -187,6 +256,13 @@ async def download_update(download_url: str, dest_path: Path) -> bool:
             dest_path.unlink(missing_ok=True)
             return False
 
+        # Strip Mark of the Web (MOTW) so Windows SmartScreen doesn't
+        # block the new EXE.  MOTW is stored as an NTFS Alternate Data
+        # Stream named "Zone.Identifier".  Even though Python's open()
+        # doesn't normally add it, belt-and-suspenders.
+        if platform.system() == "Windows":
+            _strip_motw(dest_path)
+
         logger.info(f"Download complete: {actual_size / 1024 / 1024:.1f} MB")
         return True
 
@@ -226,8 +302,17 @@ if %ERRORLEVEL%==0 (
 )
 echo Gateway process exited.
 echo Replacing executable...
+REM Retry copy up to 5 times — Defender may temporarily lock the file
+set RETRIES=0
+:copy_retry
 copy /Y "{new_exe_path}" "{current_exe_path}"
-if %ERRORLEVEL% NEQ 0 goto :copy_failed
+if %ERRORLEVEL% NEQ 0 (
+    set /a RETRIES+=1
+    if %RETRIES% GEQ 5 goto :copy_failed
+    echo   Copy attempt %RETRIES% failed, retrying in 2s...
+    timeout /t 2 /nobreak >NUL
+    goto copy_retry
+)
 echo Update complete. Starting new version...
 start "" "{current_exe_path}"
 echo Cleaning up...
@@ -236,9 +321,14 @@ del "{new_exe_path}" 2>NUL
 
 :copy_failed
 echo.
-echo ERROR: Failed to replace executable!
+echo ERROR: Failed to replace executable after 5 attempts!
+echo Windows Defender may be blocking the file.
+echo.
 echo The new version is saved at:
 echo   "{new_exe_path}"
+echo.
+echo To fix: Right-click the file above, Properties, Unblock,
+echo then manually rename it to {ASSET_NAME}.
 pause
 exit /b 1
 '''
