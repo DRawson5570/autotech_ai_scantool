@@ -211,7 +211,11 @@ def apply_update_windows(new_exe_path: Path, current_exe_path: Path) -> bool:
     bat_path = current_exe_path.parent / "_gateway_updater.bat"
 
     # Use short paths to avoid quoting issues
+    # NOTE: Paths may contain spaces and parentheses (e.g. "ELM327_Gateway (1).exe"
+    # in Downloads). We avoid putting paths inside if() blocks because CMD treats
+    # parentheses as block delimiters. Use goto-based flow instead.
     bat_content = f'''@echo off
+setlocal
 echo ELM327 Gateway Auto-Update
 echo Waiting for gateway to exit (PID {pid})...
 :wait_loop
@@ -223,17 +227,20 @@ if %ERRORLEVEL%==0 (
 echo Gateway process exited.
 echo Replacing executable...
 copy /Y "{new_exe_path}" "{current_exe_path}"
-if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: Failed to replace executable!
-    echo The new version is saved at: {new_exe_path}
-    pause
-    exit /b 1
-)
+if %ERRORLEVEL% NEQ 0 goto :copy_failed
 echo Update complete. Starting new version...
 start "" "{current_exe_path}"
 echo Cleaning up...
 del "{new_exe_path}" 2>NUL
 (goto) 2>nul & del "%~f0"
+
+:copy_failed
+echo.
+echo ERROR: Failed to replace executable!
+echo The new version is saved at:
+echo   "{new_exe_path}"
+pause
+exit /b 1
 '''
 
     try:
