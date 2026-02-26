@@ -230,7 +230,8 @@ _server_port = 8327
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    logger.info("🚗 ELM327 Gateway starting...")
+    from elm327_gateway import __version__ as _ver
+    logger.info(f"🚗 ELM327 Gateway v{_ver} starting...")
     start_mdns_service(_server_port)
     yield
     # Cleanup on shutdown
