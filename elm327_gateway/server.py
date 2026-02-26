@@ -19,6 +19,7 @@ iPhone connects to: http://<hostname>.local:8327/ui
 
 import asyncio
 import logging
+import os
 import platform
 import socket
 import time
@@ -38,6 +39,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from .service import ELM327Service
 from .session import get_session, reset_session, DiagnosticSession
+from .auto_update import (
+    check_for_update,
+    check_and_apply_update,
+    get_current_version,
+    get_exe_path,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1004,6 +1011,64 @@ async def diagnostic_snapshot():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Update & Version Endpoints
+# =============================================================================
+
+@app.get("/version")
+async def get_version():
+    """Return the current gateway version."""
+    return {
+        "version": get_current_version(),
+        "frozen": get_exe_path() is not None,
+    }
+
+
+@app.post("/check-update")
+async def trigger_update_check():
+    """Remotely trigger an update check.
+
+    If a newer version is available, downloads it and exits so the
+    updater script can launch the new version.
+
+    Returns:
+        {"status": "up-to-date"} if current version is latest.
+        {"status": "updating", "tag": "v1.2.XX"} if update found & applied.
+        {"status": "update-failed", ...} if download/apply failed.
+        {"status": "not-frozen"} if running from source (no exe to update).
+    """
+    current = get_current_version()
+    logger.info(f"Remote update check triggered (current: v{current})")
+
+    if get_exe_path() is None:
+        return {"status": "not-frozen", "version": current}
+
+    update_info = await check_for_update()
+    if not update_info:
+        return {"status": "up-to-date", "version": current}
+
+    tag = update_info["tag"]
+    logger.info(f"Remote update: {tag} available, applying...")
+
+    # Run the full update flow in the background so we can respond first
+    async def _do_update():
+        await asyncio.sleep(1)  # Let the HTTP response go out
+        should_exit = await check_and_apply_update()
+        if should_exit:
+            logger.info(f"Update to {tag} applied, exiting for restart...")
+            await asyncio.sleep(2)
+            os._exit(0)
+
+    asyncio.create_task(_do_update())
+
+    return {
+        "status": "updating",
+        "from_version": current,
+        "to_version": tag,
+        "message": f"Downloading {tag}, gateway will restart shortly",
+    }
 
 
 # =============================================================================
