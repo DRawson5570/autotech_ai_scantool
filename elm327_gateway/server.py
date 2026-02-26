@@ -241,10 +241,12 @@ async def lifespan(app: FastAPI):
         await _elm.disconnect()
         logger.info("Disconnected ELM327 on shutdown")
 
+from elm327_gateway import __version__ as _gw_version
+
 app = FastAPI(
     title="ELM327 Gateway",
     description="Bluetooth-to-HTTP bridge for ELM327 OBD-II adapters",
-    version="1.0.0",
+    version=_gw_version,
     lifespan=lifespan
 )
 

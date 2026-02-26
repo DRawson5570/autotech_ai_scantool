@@ -189,11 +189,12 @@ class GatewayTunnel:
             )
             
             # Register with the server
+            from elm327_gateway import __version__
             await self._ws.send_str(json.dumps({
                 "type": "register",
                 "shop_id": self.shop_id,
                 "api_key": self.api_key,
-                "version": "1.0.0",
+                "version": __version__,
             }))
             
             self._connected = True

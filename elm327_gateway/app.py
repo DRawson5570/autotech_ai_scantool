@@ -24,6 +24,12 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+from elm327_gateway import __version__
+from elm327_gateway.auto_update import (
+    check_and_apply_update,
+    periodic_update_check,
+)
+
 # Configure logging before anything else
 LOG_DIR = Path.home() / ".autotech_gateway"
 LOG_DIR.mkdir(exist_ok=True)
@@ -228,6 +234,19 @@ class GatewayApp:
         """Main async entry point."""
         self._loop = asyncio.get_event_loop()
         
+        # --- Auto-update check on startup ---
+        self._update_status(f"ELM327 Gateway v{__version__}")
+        try:
+            should_restart = await check_and_apply_update(
+                on_status=self._update_status
+            )
+            if should_restart:
+                self._update_status("[UPDATE] Restarting...")
+                await asyncio.sleep(2)
+                os._exit(0)
+        except Exception as e:
+            logger.warning(f"Startup update check failed: {e}")
+        
         # Start gateway server in background
         server_task = asyncio.create_task(self._start_gateway_server())
         
@@ -240,8 +259,16 @@ class GatewayApp:
         # Start tunnel (runs forever with reconnection)
         tunnel_task = asyncio.create_task(self._start_tunnel())
         
-        # Wait for both (they run forever)
-        await asyncio.gather(server_task, tunnel_task, return_exceptions=True)
+        # Periodic update check in background (every 6 hours)
+        update_task = asyncio.create_task(
+            periodic_update_check(on_status=self._update_status)
+        )
+        
+        # Wait for all (they run forever)
+        await asyncio.gather(
+            server_task, tunnel_task, update_task,
+            return_exceptions=True
+        )
     
     def run_with_tray(self):
         """Run with system tray icon."""
@@ -283,9 +310,31 @@ class GatewayApp:
                 asyncio.run_coroutine_threadsafe(self._tunnel.stop(), self._loop)
             os._exit(0)
         
+        def on_check_update(icon, item):
+            """Trigger an update check from tray menu."""
+            def _check():
+                loop = asyncio.new_event_loop()
+                try:
+                    result = loop.run_until_complete(
+                        check_and_apply_update(on_status=self._update_status)
+                    )
+                    if result:
+                        self._update_status("[UPDATE] Restarting...")
+                        import time; time.sleep(2)
+                        os._exit(0)
+                    else:
+                        self._update_status(f"Up to date (v{__version__})")
+                except Exception as e:
+                    self._update_status(f"Update check failed: {e}")
+                finally:
+                    loop.close()
+            threading.Thread(target=_check, daemon=True).start()
+        
         menu = pystray.Menu(
             pystray.MenuItem(lambda text: f"Status: {self.status}", on_status, enabled=False),
+            pystray.MenuItem(lambda text: f"Version: {__version__}", on_status, enabled=False),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Check for Updates...", on_check_update),
             pystray.MenuItem("Configure...", on_configure),
             pystray.MenuItem("View Logs", lambda: os.startfile(str(LOG_FILE)) if platform.system() == "Windows" else None),
             pystray.Menu.SEPARATOR,

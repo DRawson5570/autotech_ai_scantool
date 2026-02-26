@@ -47,6 +47,7 @@ a = Analysis(
         'elm327_gateway.server',
         'elm327_gateway.autodetect',
         'elm327_gateway.reverse_tunnel',
+        'elm327_gateway.auto_update',
     ],
     hookspath=[],
     hooksconfig={},

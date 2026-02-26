@@ -29,6 +29,23 @@ jobs:
       - name: Verify imports
         run: python -c "from elm327_gateway.app import main; print('OK')"
 
+      - name: Inject version from git tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: python
+        run: |
+          import os, re
+          tag = os.environ.get("GITHUB_REF_NAME", "0.0.0")
+          version = tag.lstrip("vV")
+          init_file = os.path.join("elm327_gateway", "__init__.py")
+          content = open(init_file).read()
+          content = re.sub(
+              r'__version__\s*=\s*"[^"]*"',
+              f'__version__ = "{version}"',
+              content,
+          )
+          open(init_file, "w").write(content)
+          print(f"Injected version: {version}")
+
       - name: Build Windows exe
         run: python -m PyInstaller gateway_app.spec --noconfirm
 
