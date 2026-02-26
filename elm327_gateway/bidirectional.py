@@ -40,6 +40,20 @@ class ActuatorState(Enum):
     DEFAULT = "default"  # Return to ECU control
 
 
+class CautionLevel(Enum):
+    """Risk level for actuator control — inspired by OpenVehicleDiag.
+    
+    NONE:  Purely observational or very low risk (EVAP purge, A/C clutch).
+    WARN:  Moderate risk — could affect drivability or comfort if left on.
+           User should confirm vehicle is stationary. (Cooling fan, air pump)
+    ALERT: High risk — could stall engine or affect safety systems.
+           Requires explicit acknowledgement. (Fuel pump, EGR valve)
+    """
+    NONE = "none"
+    WARN = "warn"
+    ALERT = "alert"
+
+
 @dataclass
 class ActuatorDefinition:
     """Definition for a controllable actuator."""
@@ -48,6 +62,8 @@ class ActuatorDefinition:
     description: str
     tid: int  # Mode $08 Test ID
     supported_states: List[ActuatorState]
+    caution_level: CautionLevel = CautionLevel.NONE
+    caution_message: str = ""  # Shown to user before WARN/ALERT controls
     
     # Optional: UDS identifier for Tier 3 control
     uds_did: Optional[int] = None
@@ -62,6 +78,7 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Controls evaporative emission purge valve",
         tid=0x01,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.NONE,
     ),
     ActuatorType.EVAP_VENT: ActuatorDefinition(
         actuator_type=ActuatorType.EVAP_VENT,
@@ -69,6 +86,7 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Controls evaporative emission vent valve",
         tid=0x02,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.NONE,
     ),
     ActuatorType.COOLING_FAN: ActuatorDefinition(
         actuator_type=ActuatorType.COOLING_FAN,
@@ -76,6 +94,8 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Engine cooling fan relay",
         tid=0x03,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.WARN,
+        caution_message="Cooling fan may spin at high speed. Keep clear of fan blades.",
     ),
     ActuatorType.AC_CLUTCH: ActuatorDefinition(
         actuator_type=ActuatorType.AC_CLUTCH,
@@ -83,6 +103,7 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Air conditioning compressor clutch",
         tid=0x04,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.NONE,
     ),
     ActuatorType.FUEL_PUMP: ActuatorDefinition(
         actuator_type=ActuatorType.FUEL_PUMP,
@@ -90,6 +111,8 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Fuel pump relay",
         tid=0x05,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.CYCLE],
+        caution_level=CautionLevel.ALERT,
+        caution_message="Disabling fuel pump will stall a running engine. Ensure vehicle is stationary and in PARK.",
     ),
     ActuatorType.EGR_VALVE: ActuatorDefinition(
         actuator_type=ActuatorType.EGR_VALVE,
@@ -97,6 +120,8 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Exhaust gas recirculation valve",
         tid=0x06,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.ALERT,
+        caution_message="EGR control affects combustion and emissions. Engine must be idling in PARK.",
     ),
     ActuatorType.AIR_PUMP: ActuatorDefinition(
         actuator_type=ActuatorType.AIR_PUMP,
@@ -104,6 +129,8 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Secondary air injection pump relay",
         tid=0x07,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.WARN,
+        caution_message="Secondary air pump adds load. Engine should be warm and idling.",
     ),
     ActuatorType.CANISTER_PURGE: ActuatorDefinition(
         actuator_type=ActuatorType.CANISTER_PURGE,
@@ -111,6 +138,7 @@ STANDARD_ACTUATORS: Dict[ActuatorType, ActuatorDefinition] = {
         description="Carbon canister purge control valve",
         tid=0x08,
         supported_states=[ActuatorState.OFF, ActuatorState.ON, ActuatorState.DEFAULT],
+        caution_level=CautionLevel.NONE,
     ),
 }
 
@@ -414,18 +442,21 @@ class UDSBidirectional:
         return await self.control_by_identifier(did, 0x00)
 
 
-# Common manufacturer-specific DIDs (for reference)
-# These require proper security access and vary by vehicle
+# Common manufacturer-specific DIDs for IO control (UDS service 0x2F)
+# ISO 14229-1:2020 ranges:
+#   0x0100-0xA5FF = Vehicle manufacturer specific (GM uses low range)
+#   0xF010-0xF0FF = Vehicle manufacturer specific (Ford uses F0xx)
+# These require proper security access and vary by model year and module
 COMMON_UDS_DIDS = {
-    # GM
+    # GM (0x01xx range — vehicle manufacturer specific)
     'gm_fuel_pump': 0x0100,
     'gm_cooling_fan_1': 0x0101,
     'gm_cooling_fan_2': 0x0102,
     'gm_ac_clutch': 0x0103,
-    
-    # Ford
+
+    # Ford (0xF0xx range — vehicle manufacturer specific)
     'ford_fuel_pump': 0xF010,
     'ford_cooling_fan': 0xF011,
-    
-    # Note: These are examples - actual DIDs vary by model year and module
+
+    # Note: These are examples — actual DIDs vary by model year and module
 }

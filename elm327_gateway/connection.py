@@ -313,6 +313,15 @@ class WiFiConnection(ELM327Connection):
             )
             self._connected = True
             
+            # Drain the initial prompt (>) sent by the adapter on connect
+            try:
+                initial = await asyncio.wait_for(
+                    self._reader.read(1024), timeout=1.0
+                )
+                logger.debug(f"Drained initial data: {initial!r}")
+            except asyncio.TimeoutError:
+                pass
+            
             # Initialize ELM327
             await self._initialize()
             

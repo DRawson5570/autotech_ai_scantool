@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from enum import Enum
 import json
 
+from .vin_decoder import decode_make_from_vin, decode_vin_full
+
 logger = logging.getLogger(__name__)
 
 
@@ -196,7 +198,7 @@ class DiagnosticSession:
     
     def set_vehicle(self, year: str = None, make: str = None, model: str = None, 
                    engine: str = None, vin: str = None):
-        """Set vehicle information."""
+        """Set vehicle information.  Auto-derives make/model/year/engine from VIN."""
         if year:
             self.vehicle_year = year
         if make:
@@ -207,6 +209,28 @@ class DiagnosticSession:
             self.vehicle_engine = engine
         if vin:
             self.vehicle_vin = vin
+            # VIN is authoritative – ALWAYS decode and overwrite vehicle info
+            try:
+                info = decode_vin_full(vin)
+                if info.get("make"):
+                    self.vehicle_make = info["make"]
+                    logger.info(f"VIN decode → make: {self.vehicle_make}")
+                if info.get("model"):
+                    self.vehicle_model = info["model"]
+                    logger.info(f"VIN decode → model: {self.vehicle_model}")
+                if info.get("year"):
+                    self.vehicle_year = info["year"]
+                    logger.info(f"VIN decode → year: {self.vehicle_year}")
+                if info.get("engine_desc"):
+                    self.vehicle_engine = info["engine_desc"]
+                    logger.info(f"VIN decode → engine: {self.vehicle_engine}")
+            except Exception as e:
+                logger.debug(f"VIN full decode failed, falling back to WMI: {e}")
+                # Fallback: at least get make from local WMI table
+                if not self.vehicle_make:
+                    local = decode_make_from_vin(vin)
+                    if local:
+                        self.vehicle_make = local
         self.updated_at = datetime.now()
     
     def get_vehicle_description(self) -> str:

@@ -269,6 +269,21 @@ class ELM327Service:
         """
         self._ensure_connected()
         return await self._protocol.read_dids(module_addr, dids, bus=bus)
+
+    async def send_uds_raw(self, module_addr: int, hex_cmd: str, bus: str = "HS-CAN") -> str:
+        """
+        Send a raw UDS command to a specific module.
+
+        Args:
+            module_addr: CAN request address (e.g. 0x726)
+            hex_cmd: Raw UDS hex command (e.g. "2FDE0003FF")
+            bus: "HS-CAN" or "MS-CAN"
+
+        Returns:
+            Raw hex response string, or empty string on failure.
+        """
+        self._ensure_connected()
+        return await self._protocol.send_uds_raw(module_addr, hex_cmd, bus=bus)
     
     # -------------------------------------------------------------------------
     # DTC Operations
@@ -636,6 +651,122 @@ class ELM327Service:
         """
         self._ensure_connected()
         return await self._connection.send_command(command)
+
+    # -------------------------------------------------------------------------
+    # Mode 06 — On-Board Monitoring Tests
+    # -------------------------------------------------------------------------
+
+    async def read_mode06_monitors(
+        self,
+        mid: Optional[int] = None,
+    ) -> list:
+        """
+        Read Mode 06 monitoring test results.
+        
+        Args:
+            mid: Specific Monitor ID to query. If None, queries supported
+                 MIDs and returns all available monitors.
+                 
+        Returns:
+            List of Monitor objects with test results
+        """
+        from .mode06 import (
+            parse_monitor_response, parse_supported_mids,
+            build_mode06_command, SUPPORT_MIDS,
+        )
+        self._ensure_connected()
+
+        if mid is not None:
+            # Query specific MID
+            cmd = build_mode06_command(mid)
+            response = await self._connection.send_command(cmd)
+            if not response or response.strip() in ("NO DATA", "?", "ERROR"):
+                return []
+            try:
+                raw = bytes.fromhex(response.replace(" ", "").replace("\n", ""))
+                return parse_monitor_response(raw)
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Failed to parse Mode 06 response for MID 0x{mid:02X}: {e}")
+                return []
+
+        # Query all supported MIDs
+        all_monitors = []
+        for support_mid in sorted(SUPPORT_MIDS):
+            cmd = build_mode06_command(support_mid)
+            response = await self._connection.send_command(cmd)
+            if not response or response.strip() in ("NO DATA", "?"):
+                continue
+            try:
+                raw = bytes.fromhex(response.replace(" ", "").replace("\n", ""))
+                supported = parse_supported_mids(support_mid, raw[2:6] if len(raw) >= 6 else b"")
+            except (ValueError, IndexError):
+                continue
+
+            for s_mid in supported:
+                if s_mid in SUPPORT_MIDS:
+                    continue
+                monitors = await self.read_mode06_monitors(s_mid)
+                all_monitors.extend(monitors)
+
+        return all_monitors
+
+    async def read_monitor_status(self) -> 'StatusResult':
+        """
+        Read PID 0x01 monitor status (MIL, DTC count, readiness monitors).
+        
+        Returns:
+            StatusResult with MIL status, DTC count, and readiness monitors
+        """
+        from .mode06 import decode_status
+        self._ensure_connected()
+        
+        data = await self._protocol.read_pid(0x01)
+        if data is None or len(data) < 4:
+            raise RuntimeError("Could not read PID 0x01 monitor status")
+        
+        return decode_status(bytes(data[:4]))
+
+    async def read_freeze_frame(self, frame: int = 0) -> Dict[str, 'PIDReading']:
+        """
+        Read freeze frame data (Mode 02).
+        
+        Freeze frame captures a snapshot of engine parameters at the 
+        moment a DTC was set. Same PIDs as Mode 01 but from stored data.
+        
+        Args:
+            frame: Frame number (usually 0)
+            
+        Returns:
+            Dict mapping PID name to PIDReading
+        """
+        from .mode06 import FREEZE_FRAME_PIDS
+        self._ensure_connected()
+        
+        results = {}
+        for pid_num, pid_name in FREEZE_FRAME_PIDS:
+            cmd = f"02 {pid_num:02X} {frame:02X}"
+            response = await self._connection.send_command(cmd)
+            if not response or response.strip() in ("NO DATA", "?"):
+                continue
+            try:
+                raw = bytes.fromhex(response.replace(" ", "").replace("\n", ""))
+                # Response: 42 <PID> <data...>
+                if len(raw) >= 3 and raw[0] == 0x42:
+                    pid_data = raw[2:]
+                    defn = PIDRegistry.get(pid_num)
+                    if defn and pid_data:
+                        value = defn.decode(list(pid_data))
+                        results[pid_name] = PIDReading(
+                            pid=pid_num,
+                            name=pid_name,
+                            value=value,
+                            unit=defn.unit,
+                        )
+            except (ValueError, IndexError) as e:
+                logger.debug(f"Failed to parse freeze frame PID 0x{pid_num:02X}: {e}")
+                continue
+        
+        return results
 
 
 # Convenience function for simple scripts

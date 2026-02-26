@@ -629,6 +629,33 @@ async def read_did(req: ReadDIDRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/reset-adapter")
+async def reset_adapter():
+    """
+    Reset the ELM327 adapter (ATZ) to clear stale data buffers.
+    
+    Use this when PID readings appear stale or inconsistent.
+    The adapter will be reinitialized but the connection stays alive.
+    """
+    _require_connection()
+    
+    try:
+        conn = _elm._connection
+        logger.info("Resetting ELM327 adapter (ATZ)...")
+        await conn.send_command("ATZ", timeout=5.0)
+        await asyncio.sleep(1.0)  # Give adapter time to reset
+        # Re-initialize settings
+        await conn.send_command("ATE0")  # Echo off
+        await conn.send_command("ATL0")  # Linefeeds off
+        await conn.send_command("ATS0")  # Spaces off
+        await conn.send_command("ATSP0")  # Auto protocol
+        logger.info("ELM327 adapter reset complete")
+        return {"status": "reset", "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        logger.error(f"Adapter reset failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/pids")
 async def read_pids(req: PIDRequest, user_id: str = "default"):
     """Read specific PIDs."""

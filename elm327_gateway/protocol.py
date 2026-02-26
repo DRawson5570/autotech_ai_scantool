@@ -113,16 +113,165 @@ FORD_MS_CAN_ADDRESSES = {
 }
 
 
-# Standard UDS DIDs (Data Identifiers) for module identification
+# Standard UDS DIDs (Data Identifiers) — ISO 14229-1:2020  §C.1
+# Range 0xF180-0xF19F: Standardized identification DIDs
+# These are universally readable from any UDS-compliant ECU (service 0x22)
 STANDARD_DIDS = {
+    # --- Boot / Application Software Identification ---
+    0xF180: "Boot Software ID",
+    0xF181: "Application Software ID",
+    0xF182: "Application Data ID",
+    # --- Fingerprints (who last flashed what) ---
+    0xF183: "Boot Software Fingerprint",
+    0xF184: "Application Software Fingerprint",
+    0xF185: "Application Data Fingerprint",
+    # --- Active Session ---
+    0xF186: "Active Diagnostic Session",
+    # --- Vehicle Manufacturer IDs ---
     0xF187: "Part Number",
     0xF188: "ECU Software Number",
     0xF189: "Software Version",
+    0xF18A: "System Supplier ID",
+    0xF18B: "ECU Manufacturing Date",
     0xF18C: "ECU Serial Number",
+    0xF18D: "Supported Functional Units",
+    0xF18E: "Kit Assembly Part Number",
+    0xF18F: "Regulation Software ID Numbers",
+    # --- Vehicle / Hardware IDs ---
     0xF190: "VIN",
     0xF191: "ECU Hardware Number",
-    0xF1A0: "Supplier ID",
+    0xF192: "Supplier HW Number",
+    0xF193: "Supplier HW Version",
+    0xF194: "Supplier SW Number",
+    0xF195: "Supplier SW Version",
+    0xF196: "Exhaust Regulation Number",
+    0xF197: "System Name / Engine Type",
+    # --- Programming / Calibration History ---
+    0xF198: "Repair Shop Code",
+    0xF199: "Programming Date",
+    0xF19A: "Calibration Shop Code",
+    0xF19B: "Calibration Date",
+    0xF19C: "Calibration Equipment SW Number",
+    0xF19D: "ECU Installation Date",
+    0xF19E: "ODX File Reference",
+    0xF19F: "Entity Data ID",
+    # --- UDS Protocol ---
+    0xFF00: "UDS Version",
 }
+
+
+# ──────────────────────────────────────────────────────
+# UDS Negative Response Codes (NRC) — ISO 14229-1:2020 §A.1
+# Service 0x7F returns: 7F <rejected-SID> <NRC>
+# ISO 14229-1:2020 Negative Response Codes
+# ──────────────────────────────────────────────────────
+UDS_NRC_CODES: Dict[int, str] = {
+    # --- General ---
+    0x10: "generalReject",
+    0x11: "serviceNotSupported",
+    0x12: "subFunctionNotSupported",
+    0x13: "incorrectMessageLengthOrInvalidFormat",
+    0x14: "responseTooLong",
+    # --- Timing ---
+    0x21: "busyRepeatRequest",
+    0x22: "conditionsNotCorrect",
+    0x23: "routineNotComplete",
+    0x24: "requestSequenceError",
+    0x25: "noResponseFromSubnetComponent",
+    0x26: "failurePreventsExecutionOfRequestedAction",
+    # --- Data / Range ---
+    0x31: "requestOutOfRange",
+    # --- Security ---
+    0x33: "securityAccessDenied",
+    0x34: "authenticationRequired",
+    0x35: "invalidKey",
+    0x36: "exceededNumberOfAttempts",
+    0x37: "requiredTimeDelayNotExpired",
+    0x38: "secureDataTransmissionRequired",
+    0x39: "secureDataTransmissionNotAllowed",
+    0x3A: "secureDataVerificationFailed",
+    # --- Certificate Verification (ISO 14229-1:2020) ---
+    0x50: "certificateVerificationFailed_InvalidTimePeriod",
+    0x51: "certificateVerificationFailed_InvalidSignature",
+    0x52: "certificateVerificationFailed_InvalidChainOfTrust",
+    0x53: "certificateVerificationFailed_InvalidType",
+    0x54: "certificateVerificationFailed_InvalidFormat",
+    0x55: "certificateVerificationFailed_InvalidContent",
+    0x56: "certificateVerificationFailed_InvalidScope",
+    0x57: "certificateVerificationFailed_InvalidCertificate",
+    0x58: "ownershipVerificationFailed",
+    0x59: "challengeCalculationFailed",
+    0x5A: "settingAccessRightsFailed",
+    0x5B: "sessionKeyCreationDerivationFailed",
+    0x5C: "configurationDataUsageFailed",
+    0x5D: "deAuthenticationFailed",
+    # --- Upload / Download ---
+    0x70: "uploadDownloadNotAccepted",
+    0x71: "transferDataSuspended",
+    0x72: "generalProgrammingFailure",
+    0x73: "wrongBlockSequenceCounter",
+    # --- Response Pending ---
+    0x78: "requestCorrectlyReceivedResponsePending",
+    # --- Sub-function ---
+    0x7E: "subFunctionNotSupportedInActiveSession",
+    0x7F: "serviceNotSupportedInActiveSession",
+    # --- Vehicle Condition ---
+    0x81: "rpmTooHigh",
+    0x82: "rpmTooLow",
+    0x83: "engineIsRunning",
+    0x84: "engineIsNotRunning",
+    0x85: "engineRunTimeTooLow",
+    0x86: "temperatureTooHigh",
+    0x87: "temperatureTooLow",
+    0x88: "vehicleSpeedTooHigh",
+    0x89: "vehicleSpeedTooLow",
+    0x8A: "throttlePedalTooHigh",
+    0x8B: "throttlePedalTooLow",
+    0x8C: "transmissionRangeNotInNeutral",
+    0x8D: "transmissionRangeNotInGear",
+    0x8F: "brakeSwitchNotClosed",
+    0x90: "shifterLeverNotInPark",
+    0x91: "torqueConverterClutchLocked",
+    # --- Voltage ---
+    0x92: "voltageTooHigh",
+    0x93: "voltageTooLow",
+    # --- Resource ---
+    0x94: "resourceTemporarilyNotAvailable",
+}
+
+
+def get_nrc_name(nrc_byte: int) -> str:
+    """Return human-readable name for a UDS Negative Response Code."""
+    return UDS_NRC_CODES.get(nrc_byte, f"unknownNRC_0x{nrc_byte:02X}")
+
+
+def get_nrc_name_hex(nrc_hex: str) -> str:
+    """Return human-readable name for a UDS NRC given a 2-char hex string."""
+    try:
+        return get_nrc_name(int(nrc_hex, 16))
+    except (ValueError, TypeError):
+        return f"NRC 0x{nrc_hex}"
+
+
+# ──────────────────────────────────────────────────────
+# UDS Diagnostic Session Types — ISO 14229-1:2020 §9.2
+# Service 0x10 DiagnosticSessionControl sub-functions
+# ──────────────────────────────────────────────────────
+UDS_SESSION_DEFAULT = 0x01
+UDS_SESSION_PROGRAMMING = 0x02
+UDS_SESSION_EXTENDED = 0x03
+UDS_SESSION_SAFETY_SYSTEM = 0x04
+
+UDS_SESSION_TYPES: Dict[int, str] = {
+    UDS_SESSION_DEFAULT: "Default",
+    UDS_SESSION_PROGRAMMING: "Programming",
+    UDS_SESSION_EXTENDED: "Extended Diagnostic",
+    UDS_SESSION_SAFETY_SYSTEM: "Safety System Diagnostic",
+    # 0x05-0x3F reserved by ISO
+    # 0x40-0x5F vehicle-manufacturer specific
+    # 0x60-0x7E system-supplier specific
+}
+
 
 # VIN WMI (chars 1-3) to secondary bus mapping
 # Determines which vehicles have MS-CAN or other secondary buses
@@ -974,16 +1123,7 @@ class OBDProtocol:
                 if "7F22" in cleaned:
                     nrc_idx = cleaned.find("7F22") + 4
                     nrc = cleaned[nrc_idx:nrc_idx+2] if nrc_idx + 2 <= len(cleaned) else "??"
-                    nrc_names = {
-                        "12": "subFunctionNotSupported",
-                        "13": "incorrectMessageLength",
-                        "14": "responseTooLong",
-                        "22": "conditionsNotCorrect",
-                        "31": "requestOutOfRange",
-                        "33": "securityAccessDenied",
-                        "72": "generalProgrammingFailure",
-                    }
-                    nrc_name = nrc_names.get(nrc, f"NRC 0x{nrc}")
+                    nrc_name = get_nrc_name_hex(nrc)
                     logger.info(f"  DID {did_hex}: negative response ({nrc_name})")
                     return None
                 logger.info(f"  DID {did_hex}: unexpected response: {resp}")
@@ -1013,6 +1153,97 @@ class OBDProtocol:
             return None
         finally:
             # Restore bus and headers
+            if switched_bus:
+                for cmd in ["STP6", "STPC1"]:
+                    try:
+                        await self.connection.send_command(cmd)
+                    except Exception:
+                        pass
+                try:
+                    await self.connection.send_command("ATSP6")
+                except Exception:
+                    pass
+            try:
+                await self.connection.send_command("ATSH7DF")
+                await self.connection.send_command("ATCRA")
+                await self.connection.send_command("ATH0")
+            except Exception:
+                pass
+
+    async def send_uds_raw(
+        self,
+        module_addr: int,
+        hex_cmd: str,
+        bus: str = "HS-CAN",
+    ) -> str:
+        """
+        Send a raw UDS command to a specific module and return the raw response.
+
+        Handles bus switching (MS-CAN ↔ HS-CAN) and CAN filter setup.
+        This is the low-level transport for arbitrary UDS services like
+        0x2F InputOutputControlByIdentifier.
+
+        Args:
+            module_addr: CAN request address (e.g. 0x726 for GEM)
+            hex_cmd: Raw UDS command as hex string (e.g. "2FDE0003FF")
+            bus: "HS-CAN" or "MS-CAN"
+
+        Returns:
+            Raw hex response string (e.g. "6FDE0003FF"), or empty string on failure.
+        """
+        switched_bus = False
+        try:
+            # Switch to MS-CAN if needed
+            if bus.upper() == "MS-CAN":
+                logger.info(f"send_uds_raw: Switching to MS-CAN")
+                resp = await self.connection.send_command("STP33")
+                if resp and "?" not in resp:
+                    switched_bus = True
+                else:
+                    for cmd in ["ATPB C004", "ATSP B"]:
+                        await self.connection.send_command(cmd)
+                    switched_bus = True
+
+            # Compute response address
+            resp_addr = None
+            for ra, info in FORD_MS_CAN_ADDRESSES.items():
+                if info["request"] == module_addr:
+                    resp_addr = ra
+                    break
+            if resp_addr is None:
+                for ra, info in ECU_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
+                resp_addr = module_addr + 8
+
+            # Set up CAN filtering
+            await self.connection.send_command("ATH1")
+            await self.connection.send_command(f"ATSH{module_addr:03X}")
+            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+
+            # Send the raw UDS command
+            resp = await self.connection.send_command(hex_cmd, timeout=5.0)
+
+            if not resp or not self._is_live_response(resp):
+                logger.info(f"send_uds_raw({module_addr:03X}, {hex_cmd}): no response")
+                return ""
+
+            # Clean and return raw hex response
+            cleaned = resp.replace(' ', '').upper()
+            # Strip CAN header if present (3-byte header like "726" at start)
+            resp_hex = f"{resp_addr:03X}"
+            if cleaned.startswith(resp_hex):
+                cleaned = cleaned[len(resp_hex):]
+
+            logger.info(f"send_uds_raw({module_addr:03X}, {hex_cmd}): {cleaned}")
+            return cleaned
+
+        except Exception as e:
+            logger.error(f"send_uds_raw({module_addr:03X}, {hex_cmd}) failed: {e}")
+            return ""
+        finally:
             if switched_bus:
                 for cmd in ["STP6", "STPC1"]:
                     try:
@@ -1762,23 +1993,82 @@ DTC_DESCRIPTIONS = {
     "U0101": "Lost Communication With TCM",
     "U0121": "Lost Communication With ABS Module",
     "U0140": "Lost Communication With BCM",
+    "U0151": "Lost Communication With Restraints Control Module",
     "U0155": "Lost Communication With Instrument Cluster",
+    "U0164": "Lost Communication With HVAC Control Module",
+    "U0168": "Lost Communication With Parking Assist Control Module",
+    "U0184": "Lost Communication With Radio/Audio Module",
+    "U0199": "Lost Communication With Door Control Module A",
+    "U0300": "Internal Control Module Software Incompatibility",
     "U0401": "Invalid Data Received From ECM/PCM",
     "U0402": "Invalid Data Received From TCM",
+    "U0415": "Invalid Data Received From ABS Module",
+    "U0422": "Invalid Data Received From BCM",
+
+    # === Body Codes (B0xxx) — SAE Standard ===
+    "B0001": "Driver Frontal Stage 1 Deployment Control",
+    "B0002": "Driver Frontal Stage 2 Deployment Control",
+    "B0003": "Passenger Frontal Stage 1 Deployment Control",
+    "B0004": "Passenger Frontal Stage 2 Deployment Control",
+    "B0010": "Driver Side Deployment Control",
+    "B0012": "Passenger Side Deployment Control",
+    "B0020": "Driver Side Curtain Deployment Control",
+    "B0022": "Passenger Side Curtain Deployment Control",
+    "B0028": "Driver Knee Deployment Control",
+    "B0051": "Driver Seat Position Sensor Circuit",
+    "B0071": "Passenger Seat Position Sensor Circuit",
+    "B0081": "Occupant Classification System Sensor",
+    "B0092": "Seat Belt Tension Sensor Circuit",
+    "B0100": "Electronic Frontal Sensor 1",
+    "B0101": "Electronic Frontal Sensor 2",
+    "B0102": "Electronic Side Sensor — Left Front",
+    "B0103": "Electronic Side Sensor — Right Front",
+
+    # === Body Codes (B1xxx-B2xxx) — Common OEM Codes ===
+    "B1200": "Climate Control Pushbutton Circuit",
+    "B1201": "Fuel Sender Circuit Open",
+    "B1213": "Anti-Theft Number of Programmed Keys Is Below Minimum",
+    "B1232": "Antenna Not Connected",
+    "B1317": "Battery Voltage High",
+    "B1318": "Battery Voltage Low",
+    "B1342": "ECU Is Faulted",
+    "B1352": "Ignition Key-in Circuit Failure",
+    "B1359": "Ignition Run/Accessory Circuit Failure",
+    "B1480": "Headlamp Switch Circuit",
+    "B1485": "Brake Pedal Input Circuit Open",
+    "B1595": "Ignition Switch Circuit Malfunction",
+    "B1600": "PATS Received Incorrect Key Code (Unprogrammed Key)",
+    "B1601": "PATS Received Invalid Format / Key Code",
+    "B1602": "PATS Received Invalid Key (Wrong Key)",
+    "B1681": "PATS Transceiver / Module Signal Not Received",
+    "B2477": "Module Configuration Failure",
 }
 
 
 def get_dtc_description(dtc_code: str) -> str:
-    """Get description for a DTC code. For manufacturer-specific codes (P1xxx),
-    returns a helpful message directing to knowledge lookup."""
+    """Get description for a DTC code.
+
+    Lookup order:
+    1. protocol.py DTC_DESCRIPTIONS (curated overlay, 269 entries)
+    2. dtc_database.py comprehensive database (~12,000 generic + 6,700 manufacturer-specific)
+    3. Fallback message for manufacturer-specific or unknown codes
+    """
     code = dtc_code.upper()
+    # 1. Check curated overlay first (our custom descriptions may be better)
     desc = DTC_DESCRIPTIONS.get(code)
     if desc:
         return desc
-    # Manufacturer-specific P1xxx codes - tell the model to use its knowledge
+    # 2. Check comprehensive database
+    try:
+        from .dtc_database import describe_dtc as _db_describe
+        desc = _db_describe(code)
+        if desc:
+            return desc
+    except ImportError:
+        pass
+    # 3. Fallback for manufacturer-specific codes
     if len(code) == 5 and code[0] == 'P' and code[1] in ('1', '2', '3'):
         return f"Manufacturer-specific code (look up {code} definition in your DTC Codes knowledge for this vehicle make)"
-    # Body/chassis/network manufacturer-specific
     if len(code) == 5 and code[0] in ('B', 'C', 'U') and code[1] in ('1', '2', '3'):
         return f"Manufacturer-specific code (look up {code} definition in your DTC Codes knowledge for this vehicle make)"
     return f"Code not in scan tool database (look up {code} in your DTC Codes knowledge)"
