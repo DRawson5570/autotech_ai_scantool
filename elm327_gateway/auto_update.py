@@ -1,20 +1,20 @@
 """
 Auto-Update for ELM327 Gateway.
 
-Checks GitHub Releases for a newer version, downloads the new EXE,
-and replaces itself via a temporary batch script (Windows) or shell
-script (Linux/Mac).
+Checks GitHub Releases for a newer version, downloads the new EXE
+with a versioned filename, and launches it — no file replacement needed.
 
 The shop laptop runs ONLY the compiled ELM327_Gateway.exe binary.
 This module lets it self-update without manual file replacement.
 
-Flow:
+Strategy (avoids ALL Windows file-locking issues):
     1. GET GitHub API /releases/latest → compare tag with __version__
-    2. If newer, download the EXE asset to a temp file
+    2. If newer, download to e.g. ELM327_Gateway_v1.2.38.exe (final name)
     3. Write a small updater script that:
        a. Waits for the current process to exit
-       b. Replaces the EXE
-       c. Relaunches the new EXE
+       b. Updates the desktop shortcut to point to the new EXE
+       c. Launches the new EXE
+       (Old version is left on disk as a fallback — no rename/delete needed)
     4. Launch the updater script and exit
 """
 
@@ -24,7 +24,6 @@ import os
 import platform
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -45,13 +44,9 @@ def _strip_motw(file_path: Path) -> None:
     Windows stores MOTW as an NTFS Alternate Data Stream (ADS)
     named 'Zone.Identifier'.  If present, SmartScreen will show
     'Windows protected your PC' when the EXE is launched.
-
-    This uses the Win32 DeleteFile API to remove the ADS, which
-    works even when os.remove() doesn't support ADS paths.
     """
     try:
         ads_path = str(file_path) + ":Zone.Identifier"
-        # Method 1: simple os.remove (works on most Windows versions)
         try:
             os.remove(ads_path)
             logger.debug(f"Stripped MOTW via os.remove: {file_path.name}")
@@ -59,7 +54,6 @@ def _strip_motw(file_path: Path) -> None:
         except (OSError, PermissionError):
             pass
 
-        # Method 2: Win32 DeleteFileW (fallback)
         try:
             import ctypes
             if ctypes.windll.kernel32.DeleteFileW(ads_path):
@@ -68,7 +62,6 @@ def _strip_motw(file_path: Path) -> None:
         except Exception:
             pass
 
-        # Method 3: PowerShell Unblock-File (last resort)
         try:
             subprocess.run(
                 ["powershell", "-Command", f'Unblock-File -Path "{file_path}"'],
@@ -79,33 +72,7 @@ def _strip_motw(file_path: Path) -> None:
             pass
 
     except Exception as e:
-        # Non-fatal — the EXE may still work without stripping
         logger.debug(f"MOTW strip failed (non-fatal): {e}")
-
-
-def _add_defender_exclusion(exe_dir: Path) -> None:
-    """Attempt to add the gateway directory to Windows Defender exclusions.
-
-    This requires admin privileges and will silently fail without them.
-    Should only be called once during initial setup (not every update).
-    """
-    try:
-        result = subprocess.run(
-            [
-                "powershell", "-Command",
-                f'Add-MpPreference -ExclusionPath "{exe_dir}"'
-            ],
-            capture_output=True, timeout=15,
-        )
-        if result.returncode == 0:
-            logger.info(f"Added Defender exclusion for {exe_dir}")
-        else:
-            logger.debug(
-                f"Defender exclusion failed (may need admin): "
-                f"{result.stderr.decode(errors='replace').strip()}"
-            )
-    except Exception as e:
-        logger.debug(f"Defender exclusion failed: {e}")
 
 
 def get_current_version() -> str:
@@ -126,7 +93,6 @@ def _parse_version(tag: str) -> Tuple[int, ...]:
             parts.append(int(p))
         except ValueError:
             parts.append(0)
-    # Pad to at least 3 elements
     while len(parts) < 3:
         parts.append(0)
     return tuple(parts)
@@ -143,7 +109,6 @@ def get_exe_path() -> Optional[Path]:
     Returns None if running from Python source (not frozen).
     """
     if getattr(sys, 'frozen', False):
-        # PyInstaller frozen executable
         return Path(sys.executable)
     return None
 
@@ -216,12 +181,11 @@ async def download_update(download_url: str, dest_path: Path) -> bool:
     """Download the new EXE to dest_path.
 
     Shows progress in the log.
-
     Returns True if download succeeded.
     """
     import aiohttp
 
-    logger.info(f"Downloading update from {download_url}...")
+    logger.info(f"Downloading update to {dest_path.name}...")
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -242,24 +206,19 @@ async def download_update(download_url: str, dest_path: Path) -> bool:
                         downloaded += len(chunk)
                         if total > 0:
                             pct = downloaded * 100 // total
-                            if pct % 25 == 0:  # Log at 0%, 25%, 50%, 75%, 100%
+                            if pct % 25 == 0:
                                 logger.info(
                                     f"  Download progress: {pct}% "
                                     f"({downloaded // 1024 // 1024}/"
                                     f"{total // 1024 // 1024} MB)"
                                 )
 
-        # Verify the file is non-trivial
         actual_size = dest_path.stat().st_size
-        if actual_size < 1_000_000:  # Less than 1MB is suspicious
+        if actual_size < 1_000_000:
             logger.error(f"Downloaded file too small ({actual_size} bytes), aborting")
             dest_path.unlink(missing_ok=True)
             return False
 
-        # Strip Mark of the Web (MOTW) so Windows SmartScreen doesn't
-        # block the new EXE.  MOTW is stored as an NTFS Alternate Data
-        # Stream named "Zone.Identifier".  Even though Python's open()
-        # doesn't normally add it, belt-and-suspenders.
         if platform.system() == "Windows":
             _strip_motw(dest_path)
 
@@ -272,32 +231,76 @@ async def download_update(download_url: str, dest_path: Path) -> bool:
         return False
 
 
+def _find_desktop_shortcuts(exe_name: str) -> list:
+    """Find all .lnk shortcuts on the Desktop that point to an EXE name pattern.
+
+    Searches for shortcuts whose target contains 'ELM327_Gateway' in the name.
+    Returns list of shortcut file paths.
+    """
+    shortcuts = []
+    try:
+        desktop = Path.home() / "Desktop"
+        if not desktop.exists():
+            # Try OneDrive Desktop
+            onedrive = Path.home() / "OneDrive" / "Desktop"
+            if onedrive.exists():
+                desktop = onedrive
+            else:
+                return []
+
+        for lnk in desktop.glob("*.lnk"):
+            # Read the shortcut target via PowerShell
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell", "-Command",
+                        f'(New-Object -ComObject WScript.Shell)'
+                        f'.CreateShortcut("{lnk}").TargetPath'
+                    ],
+                    capture_output=True, text=True, timeout=5,
+                )
+                target = result.stdout.strip()
+                if "ELM327_Gateway" in target or "elm327_gateway" in target.lower():
+                    shortcuts.append(str(lnk))
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug(f"Shortcut search failed: {e}")
+
+    return shortcuts
+
+
 def apply_update_windows(new_exe_path: Path, current_exe_path: Path) -> bool:
     """Apply update on Windows using a batch script.
 
-    The batch script:
-    1. Waits for the current process to exit (taskkill + timeout)
-    2. Waits 5s for Windows to release file handles (Defender, pystray, shell)
-    3. Renames old EXE to .old.exe (rename often succeeds when overwrite doesn't)
-    4. Copies new EXE into place, starts it
-    5. Retries up to 10 times with 3s delays if file is still locked
-    6. Deletes itself
+    New approach — no file replacement needed:
+    1. New EXE is already saved with versioned name (e.g. ELM327_Gateway_v1.2.38.exe)
+    2. Batch script waits for old process to exit
+    3. Updates any desktop shortcuts to point to new EXE
+    4. Launches new EXE
+    5. Old version stays on disk as fallback
 
     Returns True if the updater script was launched successfully.
     """
     pid = os.getpid()
     bat_path = current_exe_path.parent / "_gateway_updater.bat"
 
-    # Precompute path strings for the batch script
-    old_backup_name = f"{current_exe_path.stem}.old.exe"
-    old_backup_path = current_exe_path.parent / old_backup_name
+    # Find desktop shortcuts to update
+    shortcuts = _find_desktop_shortcuts("ELM327_Gateway")
+    shortcut_cmds = ""
+    for lnk in shortcuts:
+        # PowerShell to update shortcut target
+        shortcut_cmds += f'''
+echo Updating shortcut: {Path(lnk).name}
+powershell -Command "$s = (New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}'); $s.TargetPath = '{new_exe_path}'; $s.WorkingDirectory = '{new_exe_path.parent}'; $s.Save()"
+'''
 
-    # NOTE: Paths may contain spaces and parentheses (e.g. "ELM327_Gateway (1).exe"
-    # in Downloads). We avoid putting paths inside if() blocks because CMD treats
-    # parentheses as block delimiters. Use goto-based flow instead.
     bat_content = f'''@echo off
 setlocal
-echo ELM327 Gateway Auto-Update
+echo ============================================
+echo   ELM327 Gateway Auto-Update
+echo ============================================
+echo.
 echo Waiting for gateway to exit (PID {pid})...
 :wait_loop
 tasklist /FI "PID eq {pid}" 2>NUL | find /I "{pid}" >NUL
@@ -306,58 +309,21 @@ if %ERRORLEVEL%==0 (
     goto wait_loop
 )
 echo Gateway process exited.
-REM Give Windows time to fully release file handles
-REM (Defender scan, pystray cleanup, shell cache, etc.)
-echo Waiting for file handles to release...
-timeout /t 5 /nobreak >NUL
-echo Replacing executable...
-REM Strategy: rename old EXE first (Windows often allows rename even
-REM when delete/overwrite is blocked), then copy new EXE in.
-set RETRIES=0
-:rename_retry
-ren "{current_exe_path}" "{old_backup_name}" 2>NUL
-if exist "{current_exe_path}" (
-    set /a RETRIES+=1
-    if %RETRIES% GEQ 10 goto :copy_failed
-    echo   Attempt %RETRIES%: file still locked, waiting 3s...
-    timeout /t 3 /nobreak >NUL
-    goto rename_retry
-)
-echo   Old version renamed. Copying new version...
-copy /Y "{new_exe_path}" "{current_exe_path}"
-if %ERRORLEVEL% NEQ 0 goto :copy_new_failed
-echo Update complete. Starting new version...
-start "" "{current_exe_path}"
-echo Cleaning up...
-del "{new_exe_path}" 2>NUL
-del "{old_backup_path}" 2>NUL
+echo.
+echo New version: {new_exe_path.name}
+{shortcut_cmds}
+echo.
+echo Launching new version...
+start "" "{new_exe_path}"
+echo.
+echo Update complete!
+echo Old version kept at: {current_exe_path.name}
+timeout /t 3 /nobreak >NUL
 (goto) 2>nul & del "%~f0"
-
-:copy_new_failed
-echo   Copy failed, restoring old version...
-ren "{old_backup_path}" "{current_exe_path.name}" 2>NUL
-
-:copy_failed
-echo.
-echo ERROR: Failed to replace executable after %RETRIES% attempts!
-echo The file may still be locked by Windows Defender or another process.
-echo.
-echo The new version is saved at:
-echo   "{new_exe_path}"
-echo.
-echo To update manually:
-echo   1. Close any running ELM327 Gateway in Task Manager
-echo   2. Wait 10 seconds
-echo   3. Delete the old "{current_exe_path.name}"
-echo   4. Rename "{new_exe_path.name}" to "{current_exe_path.name}"
-echo   5. Double-click to run
-pause
-exit /b 1
 '''
 
     try:
         bat_path.write_text(bat_content, encoding="utf-8")
-        # Launch the batch script in a new console window
         subprocess.Popen(
             ["cmd.exe", "/c", str(bat_path)],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
@@ -371,9 +337,7 @@ exit /b 1
 
 
 def apply_update_unix(new_exe_path: Path, current_exe_path: Path) -> bool:
-    """Apply update on Linux/Mac using a shell script.
-
-    Similar to Windows but uses bash and kill -0 for process check.
+    """Apply update on Linux/Mac — same approach, no replacement.
 
     Returns True if the updater script was launched successfully.
     """
@@ -387,12 +351,10 @@ while kill -0 {pid} 2>/dev/null; do
     sleep 1
 done
 echo "Gateway process exited."
-echo "Replacing executable..."
-cp -f "{new_exe_path}" "{current_exe_path}"
-chmod +x "{current_exe_path}"
-echo "Update complete. Starting new version..."
-nohup "{current_exe_path}" &
-rm -f "{new_exe_path}"
+echo "Launching new version: {new_exe_path.name}..."
+chmod +x "{new_exe_path}"
+nohup "{new_exe_path}" &
+echo "Old version kept at: {current_exe_path.name}"
 rm -f "$0"
 '''
 
@@ -412,7 +374,7 @@ rm -f "$0"
 
 
 async def check_and_apply_update(on_status=None) -> bool:
-    """Full auto-update flow: check → download → apply → exit.
+    """Full auto-update flow: check → download → launch new version.
 
     Args:
         on_status: Optional callback(message: str) for status updates.
@@ -443,36 +405,39 @@ async def check_and_apply_update(on_status=None) -> bool:
     tag = update_info["tag"]
     status(f"[UPDATE] Downloading {tag}...")
 
-    # Download to temp file next to current exe
-    temp_dir = exe_path.parent
-    new_exe = temp_dir / f"ELM327_Gateway_{tag}.exe.tmp"
+    # Download as versioned filename (final name, not temp)
+    # e.g. C:\ELM Gateway\ELM327_Gateway_v1.2.38.exe
+    new_exe = exe_path.parent / f"ELM327_Gateway_{tag}.exe"
 
-    if not await download_update(update_info["download_url"], new_exe):
-        status("[UPDATE] Download failed, continuing with current version")
-        return False
+    # Skip download if already exists (e.g. previous failed launch)
+    if new_exe.exists() and new_exe.stat().st_size > 1_000_000:
+        logger.info(f"New version already downloaded: {new_exe.name}")
+    else:
+        if not await download_update(update_info["download_url"], new_exe):
+            status("[UPDATE] Download failed, continuing with current version")
+            return False
 
-    status(f"[UPDATE] Installing {tag}...")
+    status(f"[UPDATE] Launching {tag}...")
 
-    # Apply update
+    # Apply update (launch new, update shortcuts)
     if platform.system() == "Windows":
         success = apply_update_windows(new_exe, exe_path)
     else:
         success = apply_update_unix(new_exe, exe_path)
 
     if success:
-        status(f"[UPDATE] {tag} installed — restarting...")
+        status(f"[UPDATE] {tag} ready — restarting...")
         return True
     else:
-        status("[UPDATE] Install failed, continuing with current version")
-        new_exe.unlink(missing_ok=True)
+        status("[UPDATE] Launch failed, continuing with current version")
         return False
 
 
 async def periodic_update_check(on_status=None, on_exit=None):
     """Background task that checks for updates periodically.
 
-    If an update is found, it's applied and the process exits
-    (the updater script will restart it).
+    If an update is found, downloads the new version and exits
+    so the updater script can launch it.
 
     Args:
         on_status: Optional callback(message: str) for status updates.
@@ -487,7 +452,6 @@ async def periodic_update_check(on_status=None, on_exit=None):
             should_exit = await check_and_apply_update(on_status=on_status)
             if should_exit:
                 logger.info("Update applied, exiting for restart...")
-                # Give the updater script time to start monitoring our PID
                 await asyncio.sleep(2)
                 if on_exit:
                     on_exit()
