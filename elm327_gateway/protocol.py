@@ -159,6 +159,32 @@ STANDARD_DIDS = {
     0xFF00: "UDS Version",
 }
 
+# Ford-specific identification DIDs
+# Ford ECUs (especially MS-CAN modules like APIM, GEM, ABS) often DON'T
+# respond to the F1xx standard identification DIDs. Instead, Ford uses
+# manufacturer-specific DID ranges for identification and diagnostics.
+# These are well-known from FORScan and empirical testing.
+FORD_IDENTIFICATION_DIDS = {
+    # --- Diagnostic Data (DDxx) — most commonly supported ---
+    0xDD00: "Diagnostic Data 00",
+    0xDD01: "Calibration ID / Odometer",
+    0xDD02: "Calibration Verification Number",
+    0xDD03: "Module Software Version",
+    0xDD04: "Module Hardware Version",
+    0xDD05: "Diagnostic Data 05",
+    # --- Status/Config (DExx) ---
+    0xDE00: "Module Configuration 00",
+    0xDE01: "Module Configuration 01",
+    0xDE02: "Module Configuration 02",
+    0xDE03: "Module Configuration 03",
+    # --- Common Ford F1xx that sometimes work ---
+    0xF110: "ECU Part Number (Ford)",
+    0xF111: "ECU Hardware Version (Ford)",
+    0xF113: "Module Status (Ford)",
+    0xF124: "Calibration Module ID",
+    0xF125: "Ford Strategy Code",
+}
+
 
 # ──────────────────────────────────────────────────────
 # UDS Negative Response Codes (NRC) — ISO 14229-1:2020 §A.1
@@ -875,6 +901,10 @@ class OBDProtocol:
                     
                         # Read UDS DIDs for each discovered MS-CAN module
                         # (must do this while still on MS-CAN bus)
+                        # Determine manufacturer for fallback DID selection
+                        _mfr = ""
+                        if bus_config:
+                            _mfr = bus_config.get('manufacturer', '')
                         for mod in modules:
                             if mod.bus != "MS-CAN":
                                 continue
@@ -882,7 +912,11 @@ class OBDProtocol:
                                 logger.info(f"  Reading DIDs for {mod.name} ({mod.request_addr:03X})...")
                                 await self.connection.send_command(f"ATSH{mod.request_addr:03X}")
                                 await self.connection.send_command(f"ATCRA{mod.response_addr:03X}")
-                                mod.module_info = await self._read_module_dids(mod)
+                                mod.module_info = await self._read_module_dids(
+                                    mod,
+                                    manufacturer=_mfr,
+                                    try_extended_session=True,
+                                )
                                 if mod.module_info:
                                     logger.info(f"  {mod.name}: {len(mod.module_info)} DID(s) read")
                                 else:
@@ -979,38 +1013,86 @@ class OBDProtocol:
                 return False
         return True
     
-    async def _read_module_dids(self, module: 'ECUModule') -> Dict[str, str]:
+    async def _read_module_dids(
+        self,
+        module: 'ECUModule',
+        manufacturer: str = "",
+        try_extended_session: bool = False,
+    ) -> Dict[str, str]:
         """
-        Read standard UDS DIDs (Data Identifiers) from a module.
+        Read UDS DIDs (Data Identifiers) from a module.
         
-        Uses UDS Service 0x22 (ReadDataByIdentifier) to read
-        part numbers, software versions, VIN, etc.
+        First tries standard ISO 14229 identification DIDs (F180-F19F).
+        If those all fail and the manufacturer is known, falls back to
+        manufacturer-specific DIDs (e.g. Ford DDxx/DExx range).
+        
+        Optionally enters extended diagnostic session (0x10 0x03) first,
+        which some modules require before responding to 0x22.
         
         IMPORTANT: Caller must have already set ATSH and ATCRA
         for this module, and be on the correct bus.
         
         Args:
             module: The ECUModule to read from
+            manufacturer: Manufacturer name (e.g. "ford") for fallback DIDs
+            try_extended_session: If True, enter 0x10 0x03 before reading
             
         Returns:
             Dict mapping DID name to string value
         """
         info = {}
         
-        for did, label in STANDARD_DIDS.items():
+        # Optionally enter extended session first
+        if try_extended_session:
             try:
-                # UDS Service 0x22: ReadDataByIdentifier
+                resp = await self.connection.send_command("1003", timeout=3.0)
+                if resp and "50" in resp:
+                    logger.info(f"  {module.name}: extended session active")
+                else:
+                    logger.debug(f"  {module.name}: extended session not accepted: {resp}")
+            except Exception:
+                pass
+        
+        # Phase A: Standard ISO 14229 identification DIDs
+        info = await self._scan_did_list(STANDARD_DIDS)
+        
+        # Phase B: Manufacturer-specific fallback DIDs
+        if not info and manufacturer.lower() == "ford":
+            logger.info(f"  {module.name}: standard DIDs empty, trying Ford-specific DIDs...")
+            
+            # If we didn't try extended session yet, try now — Ford MS-CAN
+            # modules often require it for any DID read at all
+            if not try_extended_session:
+                try:
+                    resp = await self.connection.send_command("1003", timeout=3.0)
+                    if resp and "50" in resp:
+                        logger.info(f"  {module.name}: extended session active (auto)")
+                except Exception:
+                    pass
+            
+            info = await self._scan_did_list(FORD_IDENTIFICATION_DIDS)
+        
+        return info
+    
+    async def _scan_did_list(self, did_dict: Dict[int, str]) -> Dict[str, str]:
+        """Read a list of DIDs and return those that respond positively.
+        
+        Args:
+            did_dict: Mapping of DID number → human label
+            
+        Returns:
+            Dict of label → decoded value for DIDs that responded
+        """
+        info = {}
+        for did, label in did_dict.items():
+            try:
                 cmd = f"22{did:04X}"
                 resp = await self.connection.send_command(cmd, timeout=3.0)
                 
                 if not resp or not self._is_live_response(resp):
                     continue
                 
-                # Positive response: 62 XX XX <data>
-                # Strip any CAN header (e.g. "7E8 06 62 F1 90 ..." or "62 F1 90 ...")
                 cleaned = resp.replace(' ', '').upper()
-                
-                # Find "62" + DID in response
                 did_hex = f"{did:04X}"
                 marker = f"62{did_hex}"
                 idx = cleaned.find(marker)
@@ -1018,16 +1100,12 @@ class OBDProtocol:
                 if idx < 0:
                     continue
                 
-                # Data starts after 62+DID (6 hex chars)
                 data_hex = cleaned[idx + len(marker):]
-                
                 if not data_hex:
                     continue
                 
-                # Try decoding as ASCII text (most F1xx DIDs are text)
                 try:
                     data_bytes = bytes.fromhex(data_hex)
-                    # Filter to printable ASCII
                     text = ''.join(
                         chr(b) if 32 <= b < 127 else '' 
                         for b in data_bytes
@@ -1035,7 +1113,6 @@ class OBDProtocol:
                     if text:
                         info[label] = text
                     else:
-                        # Show as hex if not printable
                         info[label] = data_hex
                 except ValueError:
                     info[label] = data_hex
@@ -1473,10 +1550,17 @@ class OBDProtocol:
                 )
                 # Read DIDs for HS-CAN UDS-only modules (MS-CAN already done in Phase 3)
                 if module.bus == "HS-CAN" and not module.module_info:
+                    # Determine manufacturer for fallback DID selection
+                    _hs_mfr = ""
+                    if vin:
+                        _hs_bus_cfg = get_vehicle_bus_config(vin)
+                        _hs_mfr = _hs_bus_cfg.get('manufacturer', '') if _hs_bus_cfg else ""
                     try:
                         await self.connection.send_command(f"ATSH{module.request_addr:03X}")
                         await self.connection.send_command(f"ATCRA{module.response_addr:03X}")
-                        module.module_info = await self._read_module_dids(module)
+                        module.module_info = await self._read_module_dids(
+                            module, manufacturer=_hs_mfr
+                        )
                         await self.connection.send_command("ATSH7DF")
                         await self.connection.send_command("ATCRA")
                     except Exception as e:
