@@ -39,6 +39,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from .service import ELM327Service
 from .session import get_session, reset_session, DiagnosticSession
+from .can_sniffer import (
+    parse_stma_line,
+    extract_uds_exchanges,
+    SnifferCapture,
+    CANFrame,
+    module_name_for_addr,
+)
+from .dbc_decoder import (
+    LiveBroadcastDecoder, load_dbc_for_vin, load_dbc_for_oem,
+    DBCDatabase, clear_dbc_cache,
+)
 from .auto_update import (
     check_for_update,
     check_and_apply_update,
@@ -53,6 +64,15 @@ logger = logging.getLogger(__name__)
 _elm: Optional[ELM327Service] = None
 _connected_at: Optional[datetime] = None
 _keepalive_task: Optional[asyncio.Task] = None
+
+# Sniffer state
+_sniff_capture: Optional[SnifferCapture] = None
+_sniff_task: Optional[asyncio.Task] = None
+_sniff_running: bool = False
+
+# DBC broadcast decoder (populated when sniff starts with VIN/make)
+_broadcast_decoder: Optional[LiveBroadcastDecoder] = None
+_adapter_caps = None  # Set by connect if adapter detection is available
 
 # Keepalive settings
 KEEPALIVE_INTERVAL = 25  # seconds between pings
@@ -225,6 +245,17 @@ class ReadDIDRequest(BaseModel):
     module_addr: str  # Hex string like "0x760" or "760" or decimal
     dids: str  # Comma-separated hex DIDs: "F190, F187, 4001"
     bus: str = "HS-CAN"  # "HS-CAN" or "MS-CAN"
+
+class SniffStartRequest(BaseModel):
+    bus: str = "HS-CAN"
+    filter_addr: Optional[str] = None
+    vin: str = ""
+    make: str = ""
+
+class SniffLabelRequest(BaseModel):
+    module: str
+    did: str
+    label: str
 
 
 # =============================================================================
@@ -989,6 +1020,253 @@ async def clear_dtcs(user_id: str = "default"):
             return {"status": "failed", "message": "Clear command not acknowledged"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# CAN Sniffer Endpoints — Passive traffic capture (Y-Splitter mode)
+# =============================================================================
+
+async def _sniff_loop(bus: str, filter_addr: Optional[int] = None):
+    """Background task: put adapter into STMA mode and capture frames."""
+    import time as _time
+    global _sniff_capture, _sniff_running
+
+    try:
+        await _elm.send_raw_command("ATH1")
+        await _elm.send_raw_command("ATS1")
+
+        if bus == "MS-CAN":
+            await _elm.send_raw_command("STPBR 125000")
+            await _elm.send_raw_command("ATSP 6")
+
+        if filter_addr:
+            await _elm.send_raw_command(f"ATCF {filter_addr:03X}")
+            await _elm.send_raw_command("ATCM 7FF")
+
+        logger.info(f"Starting STMA on {bus}" + (f" filter=0x{filter_addr:03X}" if filter_addr else ""))
+        await _elm.send_raw_command("STMA")
+
+        while _sniff_running:
+            try:
+                line = await asyncio.wait_for(
+                    _elm.send_raw_command(""),
+                    timeout=0.5,
+                )
+                if line:
+                    for raw_line in line.splitlines():
+                        raw_line = raw_line.strip()
+                        if not raw_line or raw_line == ">" or raw_line.startswith("STMA"):
+                            continue
+                        frame = parse_stma_line(raw_line, timestamp=_time.monotonic())
+                        if frame:
+                            if filter_addr and frame.arb_id != filter_addr and frame.arb_id != (filter_addr + 8):
+                                continue
+                            _sniff_capture.frames.append(frame)
+                            # Auto-decode broadcast frames via DBC
+                            if _broadcast_decoder is not None:
+                                _broadcast_decoder.decode_frame(
+                                    frame.arb_id, frame.data, frame.timestamp
+                                )
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logger.debug(f"Sniff read error: {e}")
+
+            await asyncio.sleep(0.01)
+
+    except Exception as e:
+        logger.error(f"Sniff loop error: {e}")
+    finally:
+        try:
+            await _elm.send_raw_command("\r")
+            await asyncio.sleep(0.3)
+            await _elm.send_raw_command("ATH0")
+            await _elm.send_raw_command("ATS0")
+            if bus == "MS-CAN":
+                await _elm.send_raw_command("STPBR 500000")
+                await _elm.send_raw_command("ATSP 0")
+        except Exception:
+            pass
+        _sniff_running = False
+        logger.info("Sniff loop stopped")
+
+
+@app.post("/sniff/start")
+async def sniff_start(req: SniffStartRequest):
+    """Start passive CAN bus monitoring (sniffer mode)."""
+    global _sniff_capture, _sniff_task, _sniff_running, _broadcast_decoder
+
+    _require_connection()
+
+    if _sniff_running:
+        raise HTTPException(status_code=409, detail="Sniffer already running.")
+
+    if _adapter_caps and not _adapter_caps.supports_monitor_mode:
+        raise HTTPException(status_code=400, detail="Adapter does not support STMA.")
+
+    filter_addr = None
+    if req.filter_addr:
+        filter_addr = int(req.filter_addr.strip().replace("0x", ""), 16)
+
+    # Load DBC database for broadcast decoding
+    dbc_db: Optional[DBCDatabase] = None
+    dbc_source = ""
+    if req.vin:
+        dbc_db = load_dbc_for_vin(req.vin)
+        dbc_source = f"VIN {req.vin}"
+    elif req.make:
+        dbc_db = load_dbc_for_oem(req.make)
+        dbc_source = f"make {req.make}"
+    elif _elm and _elm.vin:
+        dbc_db = load_dbc_for_vin(_elm.vin)
+        dbc_source = f"cached VIN {_elm.vin}"
+
+    if dbc_db and dbc_db.total_messages > 0:
+        _broadcast_decoder = LiveBroadcastDecoder(dbc_db)
+        logger.info("DBC decoder loaded from %s: %d messages, %d signals",
+                    dbc_source, dbc_db.total_messages, dbc_db.total_signals)
+    else:
+        _broadcast_decoder = None
+        logger.info("No DBC files loaded — broadcast frames will not be decoded")
+
+    _sniff_capture = SnifferCapture(
+        started_at=time.monotonic(),
+        bus=req.bus,
+    )
+    _sniff_running = True
+    _sniff_task = asyncio.create_task(_sniff_loop(req.bus, filter_addr))
+
+    return {
+        "status": "started",
+        "bus": req.bus,
+        "filter": req.filter_addr or None,
+        "dbc_loaded": _broadcast_decoder is not None,
+        "dbc_info": _broadcast_decoder.get_stats() if _broadcast_decoder else None,
+        "message": "Sniffer running. Adapter is in passive listen mode."
+                   + (f" DBC decoder active ({dbc_source})." if _broadcast_decoder else ""),
+    }
+
+
+@app.post("/sniff/stop")
+async def sniff_stop():
+    """Stop passive CAN monitoring and return captured UDS exchanges."""
+    global _sniff_capture, _sniff_task, _sniff_running
+
+    if not _sniff_running and not _sniff_capture:
+        raise HTTPException(status_code=400, detail="No active sniffer session.")
+
+    _sniff_running = False
+
+    if _sniff_task:
+        try:
+            await asyncio.wait_for(_sniff_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            _sniff_task.cancel()
+        _sniff_task = None
+
+    if not _sniff_capture:
+        return {"status": "stopped", "frames": 0, "exchanges": 0}
+
+    _sniff_capture.exchanges = extract_uds_exchanges(_sniff_capture.frames)
+
+    summary = _sniff_capture.to_summary()
+    did_data = _sniff_capture.get_did_data()
+
+    result = {
+        "status": "stopped",
+        **summary,
+        "did_data": did_data,
+        "labels": {f"{k[0]}:{k[1]}": v for k, v in _sniff_capture.labels.items()},
+    }
+
+    # Include final DBC-decoded broadcast snapshot
+    if _broadcast_decoder:
+        result["broadcast"] = {
+            "key_signals": _broadcast_decoder.get_key_signals(),
+            "all_signals": _broadcast_decoder.get_snapshot(),
+            "stats": _broadcast_decoder.get_stats(),
+        }
+
+    return result
+
+
+@app.get("/sniff/frames")
+async def sniff_frames():
+    """Get live capture status and discovered DIDs so far."""
+    if not _sniff_capture:
+        raise HTTPException(status_code=400, detail="No active sniffer session.")
+
+    exchanges = extract_uds_exchanges(_sniff_capture.frames)
+    _sniff_capture.exchanges = exchanges
+
+    summary = _sniff_capture.to_summary()
+    did_data = _sniff_capture.get_did_data()
+
+    result = {
+        "running": _sniff_running,
+        **summary,
+        "did_data": did_data,
+        "labels": {f"{k[0]}:{k[1]}": v for k, v in _sniff_capture.labels.items()},
+    }
+
+    # Include DBC-decoded broadcast data if decoder is active
+    if _broadcast_decoder:
+        result["broadcast"] = {
+            "key_signals": _broadcast_decoder.get_key_signals(),
+            "stats": _broadcast_decoder.get_stats(),
+        }
+
+    return result
+
+
+@app.get("/sniff/live")
+async def sniff_live():
+    """Get live decoded broadcast data from the CAN bus.
+
+    Returns DBC-decoded signal values from broadcast CAN traffic.
+    This is the primary endpoint for the AI to read real-time vehicle state
+    without relying on the tech to narrate scan tool readings.
+
+    Only returns data while the sniffer is running with DBC files loaded.
+    """
+    if not _sniff_capture:
+        raise HTTPException(status_code=400, detail="No active sniffer session.")
+
+    if not _broadcast_decoder:
+        raise HTTPException(
+            status_code=400,
+            detail="No DBC decoder loaded. Start sniffer with VIN or make for broadcast decoding."
+        )
+
+    return {
+        "running": _sniff_running,
+        "key_signals": _broadcast_decoder.get_key_signals(),
+        "all_signals": _broadcast_decoder.get_snapshot(),
+        "stats": _broadcast_decoder.get_stats(),
+    }
+
+
+@app.post("/sniff/label")
+async def sniff_label(req: SniffLabelRequest):
+    """Label a captured DID with a human-readable name."""
+    if not _sniff_capture:
+        raise HTTPException(status_code=400, detail="No active sniffer session.")
+
+    module = req.module.strip().upper().replace("0X", "0x")
+    if not module.startswith("0x"):
+        module = f"0x{module}"
+    did = req.did.strip().upper()
+    label = req.label.strip()
+
+    _sniff_capture.labels[(module, did)] = label
+
+    return {
+        "status": "labeled",
+        "module": module,
+        "did": did,
+        "label": label,
+        "total_labels": len(_sniff_capture.labels),
+    }
 
 
 @app.get("/snapshot")

@@ -15,7 +15,7 @@ a = Analysis(
     ['elm327_gateway/app.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('elm327_gateway/dbc', 'elm327_gateway/dbc')],
     hiddenimports=[
         'aiohttp',
         'serial',
@@ -48,6 +48,8 @@ a = Analysis(
         'elm327_gateway.autodetect',
         'elm327_gateway.reverse_tunnel',
         'elm327_gateway.auto_update',
+        'elm327_gateway.dbc_decoder',
+        'elm327_gateway.can_sniffer',
     ],
     hookspath=[],
     hooksconfig={},
