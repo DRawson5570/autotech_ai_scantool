@@ -112,6 +112,52 @@ FORD_MS_CAN_ADDRESSES = {
     0x7D8: {"request": 0x7D0, "name": "AWD", "description": "All-Wheel Drive Module"},
 }
 
+# GM Enhanced CAN addresses (HS-CAN, 500 kbps, pins 6+14)
+# GM uses a +0x400 offset for responses (request 0x2xx → response 0x6xx)
+# These modules share the powertrain HS-CAN bus with the OBD-II connector.
+# Response addr → {request addr, name, description}
+GM_ENHANCED_ADDRESSES = {
+    0x640: {"request": 0x240, "name": "PCM-E", "description": "Powertrain Control Module (Enhanced)"},
+    0x641: {"request": 0x241, "name": "BCM-E", "description": "Body Control Module (Enhanced, HS-CAN)"},
+    0x642: {"request": 0x242, "name": "TCM-E", "description": "Transmission Control Module (Enhanced)"},
+    0x643: {"request": 0x243, "name": "EBCM", "description": "Electronic Brake Control Module"},
+    0x644: {"request": 0x244, "name": "HVAC-E", "description": "HVAC Control Module (Enhanced)"},
+    0x645: {"request": 0x245, "name": "EPS", "description": "Electric Power Steering"},
+    0x646: {"request": 0x246, "name": "Radio-E", "description": "Radio/Entertainment (Enhanced)"},
+    0x647: {"request": 0x247, "name": "IPC-E", "description": "Instrument Panel Cluster (Enhanced)"},
+    0x648: {"request": 0x248, "name": "TDM", "description": "Theft Deterrent Module"},
+    0x649: {"request": 0x249, "name": "SDM", "description": "Sensing and Diagnostic Module (Airbag)"},
+    0x64A: {"request": 0x24A, "name": "MSM", "description": "Memory Seat Module"},
+    0x64B: {"request": 0x24B, "name": "VCIM", "description": "Vehicle Communication Interface Module (OnStar)"},
+    0x64C: {"request": 0x24C, "name": "DIC", "description": "Driver Information Center"},
+    0x64D: {"request": 0x24D, "name": "PDM", "description": "Passenger Door Module"},
+    0x64E: {"request": 0x24E, "name": "RIM", "description": "Rear Integration Module"},
+    0x64F: {"request": 0x24F, "name": "RCDLR", "description": "Remote Control Door Lock Receiver"},
+    0x650: {"request": 0x250, "name": "TBC", "description": "Trailer Brake Controller"},
+    0x651: {"request": 0x251, "name": "ORC", "description": "Object/Radar Cruise Module"},
+    0x652: {"request": 0x252, "name": "PAM", "description": "Park Assist Module"},
+    0x654: {"request": 0x254, "name": "SWM", "description": "Steering Wheel Module"},
+}
+
+# GM SW-CAN / GMLAN addresses (Single Wire CAN, 33.3 kbps, pin 1)
+# Many body/comfort modules are ONLY accessible on SW-CAN.
+# Uses the same +0x400 response offset convention.
+# Response addr → {request addr, name, description}
+GM_SW_CAN_ADDRESSES = {
+    0x641: {"request": 0x241, "name": "BCM", "description": "Body Control Module"},
+    0x644: {"request": 0x244, "name": "HVAC", "description": "HVAC Control Module"},
+    0x646: {"request": 0x246, "name": "Radio", "description": "Radio/Entertainment Module"},
+    0x647: {"request": 0x247, "name": "IPC", "description": "Instrument Panel Cluster"},
+    0x648: {"request": 0x248, "name": "TDM", "description": "Theft Deterrent Module"},
+    0x64A: {"request": 0x24A, "name": "MSM", "description": "Memory Seat Module"},
+    0x64B: {"request": 0x24B, "name": "VCIM", "description": "Vehicle Comm Interface (OnStar)"},
+    0x64C: {"request": 0x24C, "name": "DIC", "description": "Driver Information Center"},
+    0x64D: {"request": 0x24D, "name": "PDM", "description": "Passenger Door Module"},
+    0x64E: {"request": 0x24E, "name": "RIM", "description": "Rear Integration Module"},
+    0x64F: {"request": 0x24F, "name": "RCDLR", "description": "Remote Control Door Lock Receiver"},
+    0x654: {"request": 0x254, "name": "SWM", "description": "Steering Wheel Module"},
+}
+
 
 # Standard UDS DIDs (Data Identifiers) — ISO 14229-1:2020  §C.1
 # Range 0xF180-0xF19F: Standardized identification DIDs
@@ -304,6 +350,8 @@ UDS_SESSION_TYPES: Dict[int, str] = {
 MANUFACTURER_BUS_CONFIG = {
     # Ford Motor Company — MS-CAN on pins 3+11 at 125 kbps
     "ford": {"bus": "MS-CAN", "addresses": "FORD_MS_CAN_ADDRESSES"},
+    # General Motors — SW-CAN/GMLAN on pin 1 at 33.3 kbps
+    "gm": {"bus": "SW-CAN", "addresses": "GM_SW_CAN_ADDRESSES"},
 }
 
 # WMI prefix → manufacturer key (Ford has many WMIs)
@@ -330,9 +378,13 @@ WMI_TO_MANUFACTURER = {
     "1ME": "ford", "2ME": "ford", "4M2": "ford",
     # Ford trucks
     "1FT": "ford", "3FT": "ford",
-    # --- Future: GM (GMLAN on pin 1, 33.3 kbps) ---
-    # "1G1": "gm", "1G2": "gm", "1GC": "gm", "1GK": "gm",
-    # "2G1": "gm", "2G2": "gm", "3G1": "gm", "3GK": "gm",
+    # GM — Buick, Cadillac, Chevrolet, GMC, Oldsmobile, Pontiac, Saturn, Hummer
+    "1G1": "gm", "1G2": "gm", "1G3": "gm", "1G4": "gm", "1G6": "gm",
+    "1GC": "gm", "1GK": "gm", "1GM": "gm", "1GT": "gm", "1GY": "gm",
+    "2G1": "gm", "2G2": "gm", "2G4": "gm", "2GK": "gm", "2GT": "gm",
+    "3G1": "gm", "3G7": "gm", "3GK": "gm", "3GT": "gm",
+    "5GA": "gm", "5GR": "gm", "5GT": "gm",
+    "6G1": "gm",  # GM Australia (Holden)
     # --- Future: Stellantis (CAN-IHS on pins 3+11) ---
     # "1C3": "stellantis", "1C4": "stellantis", "1C6": "stellantis",
     # "2C3": "stellantis", "2C4": "stellantis", "3C4": "stellantis",
@@ -370,7 +422,8 @@ def get_vehicle_bus_config(vin: str) -> dict:
         config = MANUFACTURER_BUS_CONFIG[mfr]
         return {
             "manufacturer": mfr,
-            "has_ms_can": True,
+            "has_ms_can": config["bus"] == "MS-CAN",
+            "has_sw_can": config["bus"] == "SW-CAN",
             "bus_type": config["bus"],
         }
     
@@ -935,6 +988,180 @@ class OBDProtocol:
                 except Exception as e:
                     logger.warning(f"MS-CAN probing failed: {e}")
             
+            # --- Phase 4: GM Enhanced HS-CAN modules (0x240-0x25F range) ---
+            # GM uses request 0x2xx → response 0x6xx (+0x400 offset) on HS-CAN
+            # Only probe if VIN indicates GM vehicle
+            mfr_name = bus_config.get('manufacturer', '') if bus_config else ''
+            if mfr_name == 'gm':
+                logger.info("Phase 4: Probing GM enhanced HS-CAN addresses (0x240-0x25F)...")
+                
+                try:
+                    # Ensure we're on HS-CAN
+                    for cmd in ["STP6", "STPC1"]:
+                        try:
+                            await self.connection.send_command(cmd)
+                        except Exception:
+                            pass
+                    await self.connection.send_command("ATSP6")
+                    await self.connection.send_command("ATH1")
+                    
+                    gm_hs_found = 0
+                    for resp_addr, info in GM_ENHANCED_ADDRESSES.items():
+                        req_addr = info["request"]
+                        
+                        # Skip if we already found this module via standard OBD addressing
+                        if resp_addr in seen_addrs:
+                            continue
+                        # Skip PCM/TCM enhanced addresses if already found via 0x7E0/0x7E2
+                        if info["name"] in ("PCM-E", "TCM-E"):
+                            std_name = info["name"].replace("-E", "")
+                            if any(m.name == std_name for m in modules):
+                                logger.info(f"  Skipping {info['name']} ({req_addr:03X}): already found via standard address")
+                                continue
+                        
+                        try:
+                            await self.connection.send_command(f"ATSH{req_addr:03X}")
+                            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+                            
+                            found = False
+                            
+                            # Try TesterPresent
+                            tp_resp = await self.connection.send_command("3E00", timeout=3.0)
+                            logger.info(f"  GM-HS {req_addr:03X} TesterPresent -> {repr(tp_resp)}")
+                            
+                            if self._is_live_response(tp_resp):
+                                found = True
+                            
+                            if not found:
+                                # Try DiagnosticSessionControl
+                                dsc_resp = await self.connection.send_command("1001", timeout=3.0)
+                                logger.info(f"  GM-HS {req_addr:03X} DiagSessionCtrl -> {repr(dsc_resp)}")
+                                
+                                if self._is_live_response(dsc_resp):
+                                    found = True
+                            
+                            if found:
+                                module = ECUModule(
+                                    response_addr=resp_addr,
+                                    request_addr=req_addr,
+                                    name=info["name"],
+                                    description=info["description"],
+                                    bus="HS-CAN",
+                                )
+                                modules.append(module)
+                                seen_addrs.add(resp_addr)
+                                gm_hs_found += 1
+                                logger.info(f"  >>> GM HS-CAN Discovered: {info['name']} ({resp_addr:03X})")
+                            else:
+                                logger.info(f"  GM-HS {req_addr:03X}: no response")
+                        
+                        except Exception as e:
+                            logger.debug(f"  GM-HS {req_addr:03X}: exception: {e}")
+                    
+                    logger.info(f"Phase 4 complete: found {gm_hs_found} GM HS-CAN module(s)")
+                    
+                    # Reset CAN receive filter
+                    try:
+                        await self.connection.send_command("ATCRA")
+                    except Exception:
+                        pass
+                
+                except Exception as e:
+                    logger.warning(f"GM HS-CAN probing failed: {e}")
+            
+                # --- Phase 5: GM SW-CAN / GMLAN (33.3 kbps, pin 1) ---
+                # Body/comfort modules accessible on Single Wire CAN
+                logger.info("Phase 5: Probing GM SW-CAN/GMLAN (33.3 kbps, pin 1)...")
+                
+                sw_can_ok = False
+                try:
+                    # STP31 = SAE J2411 Single Wire CAN (33.3 kbps, pin 1)
+                    resp = await self.connection.send_command("STP31")
+                    logger.info(f"  STP31 (GMLAN) -> {repr(resp)}")
+                    
+                    if resp and "?" not in resp:
+                        sw_can_ok = True
+                        logger.info("  SW-CAN via STP31: OK")
+                    else:
+                        # Fallback: manual baud rate config for 33.3 kbps
+                        # ATPB 81 04: User CAN protocol, 33.3 kbps
+                        for cmd in ["ATPB 8104", "ATSP B"]:
+                            resp = await self.connection.send_command(cmd)
+                            logger.info(f"  {cmd} -> {repr(resp)}")
+                        sw_can_ok = True
+                        logger.info("  SW-CAN via ATPB 8104: OK")
+                    
+                    if sw_can_ok:
+                        await self.connection.send_command("ATH1")
+                        await self.connection.send_command("ATS1")
+                        
+                        # Extended timeout for slow bus
+                        try:
+                            await self.connection.send_command("ATSTFF")
+                        except Exception:
+                            pass
+                        
+                        gm_sw_found = 0
+                        for resp_addr, info in GM_SW_CAN_ADDRESSES.items():
+                            req_addr = info["request"]
+                            
+                            # Skip if already found on HS-CAN
+                            if resp_addr in seen_addrs:
+                                logger.info(f"  Skipping {info['name']} ({req_addr:03X}): already found on HS-CAN")
+                                continue
+                            
+                            try:
+                                await self.connection.send_command(f"ATSH{req_addr:03X}")
+                                await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+                                
+                                found = False
+                                
+                                # Try TesterPresent
+                                tp_resp = await self.connection.send_command("3E00", timeout=4.0)
+                                logger.info(f"  GM-SW {req_addr:03X} TesterPresent -> {repr(tp_resp)}")
+                                
+                                if self._is_live_response(tp_resp):
+                                    found = True
+                                
+                                if not found:
+                                    # Try DiagnosticSessionControl
+                                    dsc_resp = await self.connection.send_command("1001", timeout=4.0)
+                                    logger.info(f"  GM-SW {req_addr:03X} DiagSessionCtrl -> {repr(dsc_resp)}")
+                                    
+                                    if self._is_live_response(dsc_resp):
+                                        found = True
+                                
+                                if found:
+                                    module = ECUModule(
+                                        response_addr=resp_addr,
+                                        request_addr=req_addr,
+                                        name=info["name"],
+                                        description=info["description"],
+                                        bus="SW-CAN",
+                                    )
+                                    modules.append(module)
+                                    seen_addrs.add(resp_addr)
+                                    gm_sw_found += 1
+                                    logger.info(f"  >>> GM SW-CAN Discovered: {info['name']} ({resp_addr:03X})")
+                                else:
+                                    logger.info(f"  GM-SW {req_addr:03X}: no response")
+                            
+                            except Exception as e:
+                                logger.debug(f"  GM-SW {req_addr:03X}: exception: {e}")
+                        
+                        logger.info(f"Phase 5 complete: found {gm_sw_found} GM SW-CAN module(s)")
+                        
+                        # Reset CAN receive filter
+                        try:
+                            await self.connection.send_command("ATCRA")
+                        except Exception:
+                            pass
+                    else:
+                        logger.info("Phase 5 skipped: adapter does not support SW-CAN/GMLAN")
+                
+                except Exception as e:
+                    logger.warning(f"GM SW-CAN probing failed: {e}")
+            
         except Exception as e:
             logger.error(f"Module discovery failed: {e}")
         finally:
@@ -1203,18 +1430,32 @@ class OBDProtocol:
             # Compute response address for CAN filter
             # Standard: req + 8 (e.g. 0x7E0 → 0x7E8)
             # Ford MS-CAN: varies, check FORD_MS_CAN_ADDRESSES
+            # GM Enhanced: req + 0x400 (e.g. 0x243 → 0x643)
             resp_addr = None
             for ra, info in FORD_MS_CAN_ADDRESSES.items():
                 if info["request"] == module_addr:
                     resp_addr = ra
                     break
             if resp_addr is None:
+                for ra, info in GM_ENHANCED_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
+                for ra, info in GM_SW_CAN_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
                 for ra, info in ECU_ADDRESSES.items():
                     if info["request"] == module_addr:
                         resp_addr = ra
                         break
             if resp_addr is None:
-                resp_addr = module_addr + 8  # Default offset
+                if 0x200 <= module_addr <= 0x2FF:
+                    resp_addr = module_addr + 0x400
+                else:
+                    resp_addr = module_addr + 8  # Default offset
             
             # Set up CAN filtering
             await self.connection.send_command("ATH1")
@@ -1316,6 +1557,18 @@ class OBDProtocol:
                     for cmd in ["ATPB C004", "ATSP B"]:
                         await self.connection.send_command(cmd)
                     switched_bus = True
+            elif bus.upper() == "SW-CAN":
+                logger.info(f"send_uds_raw: Switching to SW-CAN/GMLAN (33.3 kbps)")
+                resp = await self.connection.send_command("STP31")
+                if resp and "?" not in resp:
+                    switched_bus = True
+                    logger.info(f"send_uds_raw: SW-CAN via STP31")
+                else:
+                    # Fallback: manual baud rate config
+                    for cmd in ["ATPB 8104", "ATSP B"]:
+                        await self.connection.send_command(cmd)
+                    switched_bus = True
+                    logger.info(f"send_uds_raw: SW-CAN via ATPB fallback")
 
             # Compute response address
             resp_addr = None
@@ -1324,12 +1577,26 @@ class OBDProtocol:
                     resp_addr = ra
                     break
             if resp_addr is None:
+                for ra, info in GM_ENHANCED_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
+                for ra, info in GM_SW_CAN_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
                 for ra, info in ECU_ADDRESSES.items():
                     if info["request"] == module_addr:
                         resp_addr = ra
                         break
             if resp_addr is None:
-                resp_addr = module_addr + 8
+                # General fallback: GM enhanced range uses +0x400 offset
+                if 0x200 <= module_addr <= 0x2FF:
+                    resp_addr = module_addr + 0x400
+                else:
+                    resp_addr = module_addr + 8
 
             # Set up CAN filtering
             await self.connection.send_command("ATH1")
@@ -1411,12 +1678,25 @@ class OBDProtocol:
                     resp_addr = ra
                     break
             if resp_addr is None:
+                for ra, info in GM_ENHANCED_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
+                for ra, info in GM_SW_CAN_ADDRESSES.items():
+                    if info["request"] == module_addr:
+                        resp_addr = ra
+                        break
+            if resp_addr is None:
                 for ra, info in ECU_ADDRESSES.items():
                     if info["request"] == module_addr:
                         resp_addr = ra
                         break
             if resp_addr is None:
-                resp_addr = module_addr + 8
+                if 0x200 <= module_addr <= 0x2FF:
+                    resp_addr = module_addr + 0x400
+                else:
+                    resp_addr = module_addr + 8
             
             await self.connection.send_command("ATH1")
             await self.connection.send_command(f"ATSH{module_addr:03X}")
