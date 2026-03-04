@@ -1312,6 +1312,74 @@ class OBDProtocol:
         return info
     
     @staticmethod
+    def _reassemble_isotp(raw_resp: str, resp_addr_hex: str) -> str:
+        """Reassemble ISO-TP multi-frame CAN response into clean hex data.
+
+        Strips CAN headers from all frames and concatenates the UDS payload.
+        For single-frame responses, strips the PCI length byte.
+        For multi-frame responses, strips FF/CF PCI bytes and reassembles.
+
+        Args:
+            raw_resp: Raw response string from ELM327 (may contain newlines
+                      separating CAN frames, CAN headers, PCI bytes)
+            resp_addr_hex: Expected CAN response address as 3-char hex
+                           string (e.g. "7E8")
+
+        Returns:
+            Clean hex string containing only the UDS service response data
+            (e.g. "5A90A3033C3C" for a $1A90 positive response).
+        """
+        resp_addr_hex = resp_addr_hex.upper()
+        header_len = len(resp_addr_hex)
+
+        # Split into lines; strip whitespace, CAN header from each
+        lines = raw_resp.strip().split('\n')
+        stripped = []
+        for line in lines:
+            line = line.strip().replace(' ', '').upper()
+            if not line or line == '>' or 'NODATA' in line or 'ERROR' in line:
+                continue
+            # Strip CAN header if present
+            if line.startswith(resp_addr_hex):
+                line = line[header_len:]
+            stripped.append(line)
+
+        if not stripped:
+            return ""
+
+        if len(stripped) == 1:
+            frame = stripped[0]
+            # Single frame: PCI byte is 0{len} (1 hex byte = 2 chars)
+            # e.g. "065A90A3033C3C" → strip "06" → "5A90A3033C3C"
+            if len(frame) >= 2 and frame[0] == '0':
+                return frame[2:]
+            return frame
+
+        # Multi-frame: First Frame PCI is 1{LLL} (4 hex chars)
+        first = stripped[0]
+        if len(first) >= 4 and first[0] == '1':
+            # Extract declared data length from FF PCI
+            try:
+                data_len = int(first[1:4], 16)
+            except ValueError:
+                data_len = 9999  # fallback: take everything
+            # FF data starts after 4-char PCI
+            data_parts = [first[4:]]
+            # Consecutive frames: PCI is 2{seq} (2 hex chars)
+            for cf in stripped[1:]:
+                if len(cf) >= 2 and cf[0] == '2':
+                    data_parts.append(cf[2:])
+            reassembled = ''.join(data_parts)
+            # Trim to declared length (length is in bytes, hex is 2 chars/byte)
+            max_chars = data_len * 2
+            if len(reassembled) > max_chars:
+                reassembled = reassembled[:max_chars]
+            return reassembled
+
+        # Unrecognized framing — return first frame stripped of header only
+        return stripped[0]
+
+    @staticmethod
     def _decode_did_value(data_bytes: bytes) -> str:
         """Decode raw DID response bytes into a human-readable string.
 
@@ -1639,12 +1707,9 @@ class OBDProtocol:
                 logger.info(f"send_uds_raw({module_addr:03X}, {hex_cmd}): no response")
                 return ""
 
-            # Clean and return raw hex response
-            cleaned = resp.replace(' ', '').upper()
-            # Strip CAN header if present (3-byte header like "726" at start)
+            # Reassemble ISO-TP multi-frame response and strip CAN framing
             resp_hex = f"{resp_addr:03X}"
-            if cleaned.startswith(resp_hex):
-                cleaned = cleaned[len(resp_hex):]
+            cleaned = self._reassemble_isotp(resp, resp_hex)
 
             logger.info(f"send_uds_raw({module_addr:03X}, {hex_cmd}): {cleaned}")
             return cleaned
@@ -1750,7 +1815,8 @@ class OBDProtocol:
                     if not resp or not self._is_live_response(resp):
                         continue
                     
-                    cleaned = resp.replace(' ', '').upper()
+                    resp_hex_str = f"{resp_addr:03X}"
+                    cleaned = self._reassemble_isotp(resp, resp_hex_str)
                     did_hex = f"{did:04X}"
                     marker = f"62{did_hex}"
                     idx = cleaned.find(marker)
