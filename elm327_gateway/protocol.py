@@ -1234,7 +1234,115 @@ class OBDProtocol:
             )
             modules.append(module)
             logger.info(f"Discovered module via broadcast: {info['name']} ({addr_str})")
-    
+
+    # ── CAN target / bus helpers ───────────────────────────────────────
+
+    def _resolve_response_addr(self, module_addr: int) -> int:
+        """Compute the CAN response address for a given request address.
+
+        Searches known address tables (Ford MS-CAN, GM Enhanced, GM SW-CAN,
+        standard ECU) in order, then falls back to heuristics.
+        """
+        for table in (FORD_MS_CAN_ADDRESSES, GM_ENHANCED_ADDRESSES,
+                      GM_SW_CAN_ADDRESSES, ECU_ADDRESSES):
+            for ra, info in table.items():
+                if info["request"] == module_addr:
+                    return ra
+        # GM enhanced range: request 0x2XX → response 0x6XX
+        if 0x200 <= module_addr <= 0x2FF:
+            return module_addr + 0x400
+        return module_addr + 8
+
+    async def _switch_bus(self, bus: str) -> bool:
+        """Switch the adapter to the requested CAN bus.
+
+        Returns True if the bus was switched (and must be restored later).
+        Returns False for HS-CAN (no switch needed).
+        """
+        bus_upper = bus.upper()
+        if bus_upper == "MS-CAN":
+            logger.info("Switching to MS-CAN")
+            resp = await self.connection.send_command("STP33")
+            if resp and "?" not in resp:
+                return True
+            for cmd in ["ATPB C004", "ATSP B"]:
+                await self.connection.send_command(cmd)
+            return True
+        elif bus_upper == "SW-CAN":
+            logger.info("Switching to SW-CAN/GMLAN (STP63, 33.3 kbps)")
+            for cmd, desc in [("STP63", "ISO 15765 SW-CAN"),
+                              ("STP61", "raw SW-CAN")]:
+                resp = await self.connection.send_command(cmd)
+                if resp and "?" not in resp:
+                    logger.info(f"SW-CAN via {cmd} ({desc})")
+                    return True
+            # Fallback: manual baud rate config
+            for cmd in ["ATPB 8104", "ATSP B"]:
+                await self.connection.send_command(cmd)
+            logger.info("SW-CAN via ATPB fallback")
+            return True
+        return False
+
+    async def _configure_can_target(
+        self,
+        module_addr: int,
+        resp_addr: int,
+        switched_bus: bool,
+    ) -> None:
+        """Set up CAN headers, receive filter, and Flow Control.
+
+        For User protocols (SW-CAN/STP63, MS-CAN/STP33) the adapter's
+        auto-FC doesn't know the correct header to send, so multi-frame
+        ISO-TP responses fail — the ECU sends a First Frame, never
+        receives a Flow Control, and the Consecutive Frames never come.
+
+        This method explicitly configures FC for User protocols so multi-
+        frame works on every bus.
+        """
+        await self.connection.send_command("ATH1")
+        await self.connection.send_command(f"ATSH{module_addr:03X}")
+        await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+
+        if switched_bus:
+            # Explicit Flow Control for User protocols:
+            #   FC SH  = our transmit header (module_addr)
+            #   FC SD  = 30 00 00: FlowStatus=CTS, BlockSize=0, STmin=0
+            #   FC SM 1 = user-defined header + data
+            await self.connection.send_command(
+                f"AT FC SH {module_addr:03X}"
+            )
+            await self.connection.send_command("AT FC SD 30 00 00")
+            await self.connection.send_command("AT FC SM 1")
+            logger.info(
+                f"Configured explicit FC: header={module_addr:03X}, "
+                f"CTS/BS=0/STmin=0"
+            )
+
+    async def _restore_can_defaults(self, switched_bus: bool) -> None:
+        """Restore adapter to default HS-CAN state after a request."""
+        if switched_bus:
+            # Restore FC to auto mode BEFORE switching protocol back,
+            # since FC SM 0 is protocol-independent.
+            try:
+                await self.connection.send_command("AT FC SM 0")
+            except Exception:
+                pass
+            for cmd in ["STP6", "STPC1"]:
+                try:
+                    await self.connection.send_command(cmd)
+                except Exception:
+                    pass
+            try:
+                await self.connection.send_command("ATSP6")
+            except Exception:
+                pass
+        try:
+            await self.connection.send_command("ATSH7DF")
+            await self.connection.send_command("ATCRA")
+            await self.connection.send_command("ATH0")
+        except Exception:
+            pass
+
     @staticmethod
     def _is_live_response(response: str) -> bool:
         """Check if ELM327 response indicates a live module (any non-error response)."""
@@ -1490,69 +1598,9 @@ class OBDProtocol:
         """
         switched_bus = False
         try:
-            # Switch bus if needed
-            if bus.upper() == "MS-CAN":
-                logger.info(f"Switching to MS-CAN for DID read...")
-                # Try STP33 first (proven on OBDLink MX+/STN2255)
-                resp = await self.connection.send_command("STP33")
-                if resp and "?" not in resp:
-                    switched_bus = True
-                    logger.info(f"  MS-CAN via STP33: OK")
-                else:
-                    # Fallback to ELM327 Protocol B
-                    for cmd in ["ATPB C004", "ATSP B"]:
-                        await self.connection.send_command(cmd)
-                    switched_bus = True
-                    logger.info(f"  MS-CAN via ATPB/ATSP B: OK")
-            elif bus.upper() == "SW-CAN":
-                logger.info(f"Switching to SW-CAN/GMLAN for DID read...")
-                # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (GMLAN diagnostic)
-                for cmd, desc in [("STP63", "ISO 15765 SW-CAN"), ("STP61", "raw SW-CAN")]:
-                    resp = await self.connection.send_command(cmd)
-                    if resp and "?" not in resp:
-                        switched_bus = True
-                        logger.info(f"  SW-CAN via {cmd} ({desc}): OK")
-                        break
-                if not switched_bus:
-                    for cmd in ["ATPB 8104", "ATSP B"]:
-                        await self.connection.send_command(cmd)
-                    switched_bus = True
-                    logger.info(f"  SW-CAN via ATPB fallback: OK")
-            
-            # Compute response address for CAN filter
-            # Standard: req + 8 (e.g. 0x7E0 → 0x7E8)
-            # Ford MS-CAN: varies, check FORD_MS_CAN_ADDRESSES
-            # GM Enhanced: req + 0x400 (e.g. 0x243 → 0x643)
-            resp_addr = None
-            for ra, info in FORD_MS_CAN_ADDRESSES.items():
-                if info["request"] == module_addr:
-                    resp_addr = ra
-                    break
-            if resp_addr is None:
-                for ra, info in GM_ENHANCED_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                for ra, info in GM_SW_CAN_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                for ra, info in ECU_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                if 0x200 <= module_addr <= 0x2FF:
-                    resp_addr = module_addr + 0x400
-                else:
-                    resp_addr = module_addr + 8  # Default offset
-            
-            # Set up CAN filtering
-            await self.connection.send_command("ATH1")
-            await self.connection.send_command(f"ATSH{module_addr:03X}")
-            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+            switched_bus = await self._switch_bus(bus)
+            resp_addr = self._resolve_response_addr(module_addr)
+            await self._configure_can_target(module_addr, resp_addr, switched_bus)
             
             # UDS Service 0x22: ReadDataByIdentifier
             cmd = f"22{did:04X}"
@@ -1562,8 +1610,9 @@ class OBDProtocol:
                 logger.info(f"  DID {did:04X} from {module_addr:03X}: no response")
                 return None
             
-            # Parse positive response: 62 XX XX <data>
-            cleaned = resp.replace(' ', '').upper()
+            # Reassemble ISO-TP and parse positive response: 62 XX XX <data>
+            resp_hex = f"{resp_addr:03X}"
+            cleaned = self._reassemble_isotp(resp, resp_hex)
             did_hex = f"{did:04X}"
             marker = f"62{did_hex}"
             idx = cleaned.find(marker)
@@ -1598,23 +1647,7 @@ class OBDProtocol:
             logger.error(f"read_did({module_addr:03X}, {did:04X}) failed: {e}")
             return None
         finally:
-            # Restore bus and headers
-            if switched_bus:
-                for cmd in ["STP6", "STPC1"]:
-                    try:
-                        await self.connection.send_command(cmd)
-                    except Exception:
-                        pass
-                try:
-                    await self.connection.send_command("ATSP6")
-                except Exception:
-                    pass
-            try:
-                await self.connection.send_command("ATSH7DF")
-                await self.connection.send_command("ATCRA")
-                await self.connection.send_command("ATH0")
-            except Exception:
-                pass
+            await self._restore_can_defaults(switched_bus)
 
     async def send_uds_raw(
         self,
@@ -1625,80 +1658,22 @@ class OBDProtocol:
         """
         Send a raw UDS command to a specific module and return the raw response.
 
-        Handles bus switching (MS-CAN ↔ HS-CAN) and CAN filter setup.
-        This is the low-level transport for arbitrary UDS services like
-        0x2F InputOutputControlByIdentifier.
+        Handles bus switching (MS-CAN / SW-CAN ↔ HS-CAN), CAN filter setup,
+        and Flow Control configuration for User protocols.
 
         Args:
             module_addr: CAN request address (e.g. 0x726 for GEM)
             hex_cmd: Raw UDS command as hex string (e.g. "2FDE0003FF")
-            bus: "HS-CAN" or "MS-CAN"
+            bus: "HS-CAN", "MS-CAN", or "SW-CAN"
 
         Returns:
             Raw hex response string (e.g. "6FDE0003FF"), or empty string on failure.
         """
         switched_bus = False
         try:
-            # Switch to MS-CAN if needed
-            if bus.upper() == "MS-CAN":
-                logger.info(f"send_uds_raw: Switching to MS-CAN")
-                resp = await self.connection.send_command("STP33")
-                if resp and "?" not in resp:
-                    switched_bus = True
-                else:
-                    for cmd in ["ATPB C004", "ATSP B"]:
-                        await self.connection.send_command(cmd)
-                    switched_bus = True
-            elif bus.upper() == "SW-CAN":
-                # Per OBDLink FRPM manual:
-                # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (SW-CAN/GMLAN)
-                # NOTE: STP31 was WRONG — that's 500kbps HS-CAN raw, NOT GMLAN!
-                logger.info(f"send_uds_raw: Switching to SW-CAN/GMLAN (STP63, 33.3 kbps)")
-                for cmd, desc in [("STP63", "ISO 15765 SW-CAN"), ("STP61", "raw SW-CAN")]:
-                    resp = await self.connection.send_command(cmd)
-                    if resp and "?" not in resp:
-                        switched_bus = True
-                        logger.info(f"send_uds_raw: SW-CAN via {cmd} ({desc})")
-                        break
-                if not switched_bus:
-                    # Fallback: manual baud rate config for 33.3 kbps
-                    for cmd in ["ATPB 8104", "ATSP B"]:
-                        await self.connection.send_command(cmd)
-                    switched_bus = True
-                    logger.info(f"send_uds_raw: SW-CAN via ATPB fallback")
-
-            # Compute response address
-            resp_addr = None
-            for ra, info in FORD_MS_CAN_ADDRESSES.items():
-                if info["request"] == module_addr:
-                    resp_addr = ra
-                    break
-            if resp_addr is None:
-                for ra, info in GM_ENHANCED_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                for ra, info in GM_SW_CAN_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                for ra, info in ECU_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                # General fallback: GM enhanced range uses +0x400 offset
-                if 0x200 <= module_addr <= 0x2FF:
-                    resp_addr = module_addr + 0x400
-                else:
-                    resp_addr = module_addr + 8
-
-            # Set up CAN filtering
-            await self.connection.send_command("ATH1")
-            await self.connection.send_command(f"ATSH{module_addr:03X}")
-            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
+            switched_bus = await self._switch_bus(bus)
+            resp_addr = self._resolve_response_addr(module_addr)
+            await self._configure_can_target(module_addr, resp_addr, switched_bus)
 
             # Send the raw UDS command
             resp = await self.connection.send_command(hex_cmd, timeout=5.0)
@@ -1718,22 +1693,7 @@ class OBDProtocol:
             logger.error(f"send_uds_raw({module_addr:03X}, {hex_cmd}) failed: {e}")
             return ""
         finally:
-            if switched_bus:
-                for cmd in ["STP6", "STPC1"]:
-                    try:
-                        await self.connection.send_command(cmd)
-                    except Exception:
-                        pass
-                try:
-                    await self.connection.send_command("ATSP6")
-                except Exception:
-                    pass
-            try:
-                await self.connection.send_command("ATSH7DF")
-                await self.connection.send_command("ATCRA")
-                await self.connection.send_command("ATH0")
-            except Exception:
-                pass
+            await self._restore_can_defaults(switched_bus)
 
     async def read_dids(
         self,
@@ -1755,58 +1715,11 @@ class OBDProtocol:
         results = {}
         switched_bus = False
         try:
-            # Switch bus if needed
-            if bus.upper() == "MS-CAN":
-                resp = await self.connection.send_command("STP33")
-                if resp and "?" not in resp:
-                    switched_bus = True
-                else:
-                    for cmd in ["ATPB C004", "ATSP B"]:
-                        await self.connection.send_command(cmd)
-                    switched_bus = True
-            elif bus.upper() == "SW-CAN":
-                # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (GMLAN)
-                for cmd, desc in [("STP63", "ISO 15765 SW-CAN"), ("STP61", "raw SW-CAN")]:
-                    resp = await self.connection.send_command(cmd)
-                    if resp and "?" not in resp:
-                        switched_bus = True
-                        break
-                if not switched_bus:
-                    for cmd in ["ATPB 8104", "ATSP B"]:
-                        await self.connection.send_command(cmd)
-                    switched_bus = True
-            
-            # Compute response address
-            resp_addr = None
-            for ra, info in FORD_MS_CAN_ADDRESSES.items():
-                if info["request"] == module_addr:
-                    resp_addr = ra
-                    break
-            if resp_addr is None:
-                for ra, info in GM_ENHANCED_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                for ra, info in GM_SW_CAN_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                for ra, info in ECU_ADDRESSES.items():
-                    if info["request"] == module_addr:
-                        resp_addr = ra
-                        break
-            if resp_addr is None:
-                if 0x200 <= module_addr <= 0x2FF:
-                    resp_addr = module_addr + 0x400
-                else:
-                    resp_addr = module_addr + 8
-            
-            await self.connection.send_command("ATH1")
-            await self.connection.send_command(f"ATSH{module_addr:03X}")
-            await self.connection.send_command(f"ATCRA{resp_addr:03X}")
-            
+            switched_bus = await self._switch_bus(bus)
+            resp_addr = self._resolve_response_addr(module_addr)
+            await self._configure_can_target(module_addr, resp_addr, switched_bus)
+
+            resp_hex_str = f"{resp_addr:03X}"
             for did in dids:
                 try:
                     cmd = f"22{did:04X}"
@@ -1815,7 +1728,6 @@ class OBDProtocol:
                     if not resp or not self._is_live_response(resp):
                         continue
                     
-                    resp_hex_str = f"{resp_addr:03X}"
                     cleaned = self._reassemble_isotp(resp, resp_hex_str)
                     did_hex = f"{did:04X}"
                     marker = f"62{did_hex}"
@@ -1849,22 +1761,7 @@ class OBDProtocol:
         except Exception as e:
             logger.error(f"read_dids({module_addr:03X}) failed: {e}")
         finally:
-            if switched_bus:
-                for cmd in ["STP6", "STPC1"]:
-                    try:
-                        await self.connection.send_command(cmd)
-                    except Exception:
-                        pass
-                try:
-                    await self.connection.send_command("ATSP6")
-                except Exception:
-                    pass
-            try:
-                await self.connection.send_command("ATSH7DF")
-                await self.connection.send_command("ATCRA")
-                await self.connection.send_command("ATH0")
-            except Exception:
-                pass
+            await self._restore_can_defaults(switched_bus)
         
         return results
 
