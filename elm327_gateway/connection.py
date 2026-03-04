@@ -58,6 +58,7 @@ class ELM327Connection(ABC):
         self._last_activity: float = 0.0  # monotonic timestamp of last command
         self._consecutive_timeouts: int = 0
         self._total_timeouts: int = 0
+        self._needs_reconnect: bool = False
     
     @property
     def connected(self) -> bool:
@@ -87,6 +88,13 @@ class ELM327Connection(ABC):
         Raises:
             ConnectionError: If not connected or adapter is unresponsive
         """
+        # If a reconnect is pending from a previous cycle, do it before
+        # acquiring the lock (reconnect internally calls send_command).
+        if self._needs_reconnect:
+            self._needs_reconnect = False
+            logger.info("Executing deferred reconnect before next command...")
+            await self._force_reconnect()
+        
         # Use wait_for on lock acquisition so a stuck command can't block
         # all other commands forever.
         try:
@@ -132,9 +140,12 @@ class ELM327Connection(ABC):
                 if self._consecutive_timeouts >= self.MAX_CONSECUTIVE_TIMEOUTS:
                     logger.error(
                         f"Adapter unresponsive after {self._consecutive_timeouts} consecutive timeouts. "
-                        f"Forcing reconnect..."
+                        f"Scheduling reconnect for next command..."
                     )
-                    await self._force_reconnect()
+                    # Don't reconnect here — we're holding the lock and
+                    # reconnect calls send_command internally (deadlock).
+                    # Set a flag so the NEXT send_command call does it.
+                    self._needs_reconnect = True
             
             return response
         finally:
