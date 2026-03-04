@@ -17,6 +17,7 @@ through the server's proxy, which forwards it over the WebSocket.
 import asyncio
 import json
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Callable, Dict, Optional
@@ -75,6 +76,10 @@ class GatewayTunnel:
         self._connected = False
         self._reconnect_delay = 5  # seconds
         self._max_reconnect_delay = 60
+        # Request lifecycle management
+        self._active_tasks: Dict[str, asyncio.Task] = {}  # request_id -> Task
+        self._cancelled: set = set()  # request IDs cancelled by server
+        self._max_concurrent = 4  # max simultaneous adapter requests
     
     @property
     def connected(self) -> bool:
@@ -113,10 +118,41 @@ class GatewayTunnel:
         except Exception as e:
             return {"status": 500, "body": {"detail": str(e)}}
     
-    async def _handle_request_background(self, request_id: str, method: str, path: str, body: dict):
-        """Handle a forwarded request in a background task (non-blocking)."""
+    async def _handle_request_background(self, request_id: str, method: str, path: str, body: dict, deadline: float = None):
+        """Handle a forwarded request in a background task (non-blocking).
+        
+        Checks deadline before and after processing. If the proxy has already
+        timed out, skips the request entirely to avoid piling up stale commands
+        on the adapter.
+        """
         try:
+            # Check if already cancelled by the proxy
+            if request_id in self._cancelled:
+                self._cancelled.discard(request_id)
+                logger.info(f"⏭ Skipping cancelled request {request_id}: {method} {path}")
+                return
+            
+            # Check if deadline has already passed
+            if deadline and time.time() > deadline:
+                logger.info(f"⏭ Skipping expired request {request_id}: {method} {path} "
+                           f"(expired {time.time() - deadline:.1f}s ago)")
+                # Still send a response so proxy doesn't hang if it's still listening
+                if self._ws and not self._ws.closed:
+                    await self._ws.send_str(json.dumps({
+                        "type": "response",
+                        "id": request_id,
+                        "status": 408,
+                        "body": {"detail": "Request expired before processing"},
+                    }))
+                return
+            
             result = await self._forward_to_local(method, path, body)
+
+            # Check again after processing — if cancelled during execution,
+            # still send the response (it's already done) but log it
+            if request_id in self._cancelled:
+                self._cancelled.discard(request_id)
+                logger.info(f"Request {request_id} completed but was cancelled during execution")
 
             response = {
                 "type": "response",
@@ -130,8 +166,12 @@ class GatewayTunnel:
                 logger.info(f"→ Response {request_id}: {result['status']}")
             else:
                 logger.warning(f"Cannot send response {request_id}: WebSocket closed")
+        except asyncio.CancelledError:
+            logger.info(f"✋ Request {request_id} cancelled: {method} {path}")
         except Exception as e:
             logger.error(f"Background request {request_id} failed: {e}")
+        finally:
+            self._active_tasks.pop(request_id, None)
 
     async def _handle_message(self, msg_data: str):
         """Handle an incoming message from the server."""
@@ -149,14 +189,51 @@ class GatewayTunnel:
             method = msg.get("method", "GET")
             path = msg.get("path", "/")
             body = msg.get("body")
+            deadline = msg.get("deadline")  # Unix timestamp when proxy will give up
             
             logger.info(f"← Request {request_id}: {method} {path}")
             
+            # Check if already expired before even starting
+            if deadline and time.time() > deadline:
+                logger.info(f"⏭ Dropping already-expired request {request_id}: {method} {path}")
+                if self._ws and not self._ws.closed:
+                    await self._ws.send_str(json.dumps({
+                        "type": "response",
+                        "id": request_id,
+                        "status": 408,
+                        "body": {"detail": "Request expired before delivery"},
+                    }))
+                return
+            
+            # Check concurrent request limit to prevent queue buildup
+            active_count = len(self._active_tasks)
+            if active_count >= self._max_concurrent:
+                logger.warning(f"⚠ Rejecting request {request_id}: {active_count} requests already in flight")
+                if self._ws and not self._ws.closed:
+                    await self._ws.send_str(json.dumps({
+                        "type": "response",
+                        "id": request_id,
+                        "status": 429,
+                        "body": {"detail": f"Gateway busy: {active_count} requests in flight"},
+                    }))
+                return
+            
             # Run in background so the message loop keeps processing
             # pings/heartbeats while long operations (module scan) run
-            asyncio.create_task(
-                self._handle_request_background(request_id, method, path, body)
+            task = asyncio.create_task(
+                self._handle_request_background(request_id, method, path, body, deadline)
             )
+            self._active_tasks[request_id] = task
+        
+        elif msg_type == "cancel":
+            # Proxy timed out — cancel the in-flight request if possible
+            request_id = msg.get("id")
+            logger.info(f"✋ Cancel received for {request_id}")
+            self._cancelled.add(request_id)
+            task = self._active_tasks.get(request_id)
+            if task and not task.done():
+                task.cancel()
+                logger.info(f"Cancelled active task {request_id}")
         
         elif msg_type == "ping":
             # Server keepalive
@@ -189,12 +266,11 @@ class GatewayTunnel:
             )
             
             # Register with the server
-            from elm327_gateway import __version__
             await self._ws.send_str(json.dumps({
                 "type": "register",
                 "shop_id": self.shop_id,
                 "api_key": self.api_key,
-                "version": __version__,
+                "version": "1.0.0",
             }))
             
             self._connected = True
