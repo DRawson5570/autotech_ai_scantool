@@ -246,6 +246,11 @@ class ReadDIDRequest(BaseModel):
     dids: str  # Comma-separated hex DIDs: "F190, F187, 4001"
     bus: str = "HS-CAN"  # "HS-CAN" or "MS-CAN"
 
+class UDSRawRequest(BaseModel):
+    module_addr: str  # Hex string like "0x7E0" or "7E0"
+    command: str  # Raw UDS hex command e.g. "22F190" or "2F F100 03"
+    bus: str = "HS-CAN"  # "HS-CAN" or "MS-CAN"
+
 class SniffStartRequest(BaseModel):
     bus: str = "HS-CAN"
     filter_addr: Optional[str] = None
@@ -772,6 +777,39 @@ async def read_did(req: ReadDIDRequest):
         
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid address or DID format: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/uds-raw")
+async def uds_raw_command(req: UDSRawRequest):
+    """Send a raw UDS command to a specific ECU module.
+
+    Used for UDS services like ReadDataByIdentifier (0x22),
+    IO Control (0x2F), and other advanced diagnostics.
+    """
+    _require_connection()
+
+    try:
+        addr_str = req.module_addr.strip().lower().replace("0x", "")
+        module_addr = int(addr_str, 16)
+
+        command = req.command.strip().replace(" ", "").upper()
+        if not command or len(command) < 2:
+            raise HTTPException(status_code=400, detail="Command too short")
+
+        response = await _elm.send_uds_raw(module_addr, command, bus=req.bus)
+
+        return {
+            "module_addr": f"0x{module_addr:03X}",
+            "bus": req.bus,
+            "command": command,
+            "response": response,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid address: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
