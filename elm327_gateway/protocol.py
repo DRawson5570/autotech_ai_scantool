@@ -141,6 +141,7 @@ GM_ENHANCED_ADDRESSES = {
 
 # GM SW-CAN / GMLAN addresses (Single Wire CAN, 33.3 kbps, pin 1)
 # Many body/comfort modules are ONLY accessible on SW-CAN.
+# Per OBDLink FRPM manual: STP63 = ISO 15765, 11-bit, 33.3kbps (GMLAN diagnostic)
 # Uses the same +0x400 response offset convention.
 # Response addr → {request addr, name, description}
 GM_SW_CAN_ADDRESSES = {
@@ -1075,21 +1076,30 @@ class OBDProtocol:
                 
                 sw_can_ok = False
                 try:
-                    # STP31 = SAE J2411 Single Wire CAN (33.3 kbps, pin 1)
-                    resp = await self.connection.send_command("STP31")
-                    logger.info(f"  STP31 (GMLAN) -> {repr(resp)}")
+                    # Per OBDLink FRPM manual:
+                    # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (SW-CAN/GMLAN)
+                    # NOTE: STP31 is 500kbps HS-CAN raw — NOT GMLAN!
+                    # SW-CAN protocols: 61=raw 11-bit, 62=raw 29-bit, 63=ISO15765 11-bit, 64=ISO15765 29-bit
+                    stp_methods = [
+                        ("STP63", "ISO 15765 SW-CAN 33.3k (diagnostic)"),
+                        ("STP61", "ISO 11898 SW-CAN 33.3k (raw)"),
+                    ]
+                    for cmd, desc in stp_methods:
+                        resp = await self.connection.send_command(cmd)
+                        logger.info(f"  {cmd} ({desc}) -> {repr(resp)}")
+                        if resp and "?" not in resp:
+                            sw_can_ok = True
+                            logger.info(f"  SW-CAN via {cmd}: OK")
+                            break
                     
-                    if resp and "?" not in resp:
-                        sw_can_ok = True
-                        logger.info("  SW-CAN via STP31: OK")
-                    else:
+                    if not sw_can_ok:
                         # Fallback: manual baud rate config for 33.3 kbps
-                        # ATPB 81 04: User CAN protocol, 33.3 kbps
+                        # ATPB 81 04: User CAN protocol, 33.3 kbps  
                         for cmd in ["ATPB 8104", "ATSP B"]:
                             resp = await self.connection.send_command(cmd)
                             logger.info(f"  {cmd} -> {repr(resp)}")
                         sw_can_ok = True
-                        logger.info("  SW-CAN via ATPB 8104: OK")
+                        logger.info("  SW-CAN via ATPB 8104 fallback: OK")
                     
                     if sw_can_ok:
                         await self.connection.send_command("ATH1")
@@ -1405,14 +1415,14 @@ class OBDProtocol:
         Args:
             module_addr: CAN request address (e.g. 0x760 for GEM)
             did: UDS DID number (e.g. 0xF190 for VIN, or 0x4001)
-            bus: "HS-CAN" or "MS-CAN"
+            bus: "HS-CAN", "MS-CAN", or "SW-CAN"
             
         Returns:
             DID value as string (ASCII if printable, hex otherwise), or None
         """
         switched_bus = False
         try:
-            # Switch to MS-CAN if needed
+            # Switch bus if needed
             if bus.upper() == "MS-CAN":
                 logger.info(f"Switching to MS-CAN for DID read...")
                 # Try STP33 first (proven on OBDLink MX+/STN2255)
@@ -1426,6 +1436,20 @@ class OBDProtocol:
                         await self.connection.send_command(cmd)
                     switched_bus = True
                     logger.info(f"  MS-CAN via ATPB/ATSP B: OK")
+            elif bus.upper() == "SW-CAN":
+                logger.info(f"Switching to SW-CAN/GMLAN for DID read...")
+                # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (GMLAN diagnostic)
+                for cmd, desc in [("STP63", "ISO 15765 SW-CAN"), ("STP61", "raw SW-CAN")]:
+                    resp = await self.connection.send_command(cmd)
+                    if resp and "?" not in resp:
+                        switched_bus = True
+                        logger.info(f"  SW-CAN via {cmd} ({desc}): OK")
+                        break
+                if not switched_bus:
+                    for cmd in ["ATPB 8104", "ATSP B"]:
+                        await self.connection.send_command(cmd)
+                    switched_bus = True
+                    logger.info(f"  SW-CAN via ATPB fallback: OK")
             
             # Compute response address for CAN filter
             # Standard: req + 8 (e.g. 0x7E0 → 0x7E8)
@@ -1558,13 +1582,18 @@ class OBDProtocol:
                         await self.connection.send_command(cmd)
                     switched_bus = True
             elif bus.upper() == "SW-CAN":
-                logger.info(f"send_uds_raw: Switching to SW-CAN/GMLAN (33.3 kbps)")
-                resp = await self.connection.send_command("STP31")
-                if resp and "?" not in resp:
-                    switched_bus = True
-                    logger.info(f"send_uds_raw: SW-CAN via STP31")
-                else:
-                    # Fallback: manual baud rate config
+                # Per OBDLink FRPM manual:
+                # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (SW-CAN/GMLAN)
+                # NOTE: STP31 was WRONG — that's 500kbps HS-CAN raw, NOT GMLAN!
+                logger.info(f"send_uds_raw: Switching to SW-CAN/GMLAN (STP63, 33.3 kbps)")
+                for cmd, desc in [("STP63", "ISO 15765 SW-CAN"), ("STP61", "raw SW-CAN")]:
+                    resp = await self.connection.send_command(cmd)
+                    if resp and "?" not in resp:
+                        switched_bus = True
+                        logger.info(f"send_uds_raw: SW-CAN via {cmd} ({desc})")
+                        break
+                if not switched_bus:
+                    # Fallback: manual baud rate config for 33.3 kbps
                     for cmd in ["ATPB 8104", "ATSP B"]:
                         await self.connection.send_command(cmd)
                     switched_bus = True
@@ -1653,7 +1682,7 @@ class OBDProtocol:
         Args:
             module_addr: CAN request address
             dids: List of DID numbers to read
-            bus: "HS-CAN" or "MS-CAN"
+            bus: "HS-CAN", "MS-CAN", or "SW-CAN"
             
         Returns:
             Dict mapping "DID_XXXX" or known label to value string
@@ -1661,13 +1690,24 @@ class OBDProtocol:
         results = {}
         switched_bus = False
         try:
-            # Switch to MS-CAN if needed
+            # Switch bus if needed
             if bus.upper() == "MS-CAN":
                 resp = await self.connection.send_command("STP33")
                 if resp and "?" not in resp:
                     switched_bus = True
                 else:
                     for cmd in ["ATPB C004", "ATSP B"]:
+                        await self.connection.send_command(cmd)
+                    switched_bus = True
+            elif bus.upper() == "SW-CAN":
+                # STP63 = ISO 15765, 11-bit Tx, 33.3kbps, DLC=8 (GMLAN)
+                for cmd, desc in [("STP63", "ISO 15765 SW-CAN"), ("STP61", "raw SW-CAN")]:
+                    resp = await self.connection.send_command(cmd)
+                    if resp and "?" not in resp:
+                        switched_bus = True
+                        break
+                if not switched_bus:
+                    for cmd in ["ATPB 8104", "ATSP B"]:
                         await self.connection.send_command(cmd)
                     switched_bus = True
             
