@@ -46,6 +46,9 @@ class ConnectionConfig:
 class ELM327Connection(ABC):
     """Abstract base class for ELM327 connections."""
     
+    # After this many consecutive timeouts, force a reconnect
+    MAX_CONSECUTIVE_TIMEOUTS = 5
+    
     def __init__(self, config: ConnectionConfig):
         self.config = config
         self._connected = False
@@ -53,6 +56,8 @@ class ELM327Connection(ABC):
         self._writer: Optional[asyncio.StreamWriter] = None
         self._lock = asyncio.Lock()
         self._last_activity: float = 0.0  # monotonic timestamp of last command
+        self._consecutive_timeouts: int = 0
+        self._total_timeouts: int = 0
     
     @property
     def connected(self) -> bool:
@@ -78,12 +83,29 @@ class ELM327Connection(ABC):
             
         Returns:
             Response string with prompt removed
+            
+        Raises:
+            ConnectionError: If not connected or adapter is unresponsive
         """
-        async with self._lock:
+        # Use wait_for on lock acquisition so a stuck command can't block
+        # all other commands forever.
+        try:
+            await asyncio.wait_for(self._lock.acquire(), timeout=max(timeout or self.config.timeout, 10.0))
+        except asyncio.TimeoutError:
+            logger.error(f"Lock acquisition timed out for '{command}' — adapter is stuck")
+            self._consecutive_timeouts += 1
+            self._total_timeouts += 1
+            raise ConnectionError("Adapter busy (lock timeout). Send reset-adapter or restart gateway.")
+        
+        try:
             if not self._connected or not self._writer:
                 raise ConnectionError("Not connected to ELM327")
             
             timeout = timeout or self.config.timeout
+            
+            # Flush any stale data sitting in the read buffer before sending
+            if self._consecutive_timeouts > 0:
+                await self._flush_read_buffer()
             
             # Send command with carriage return
             cmd_bytes = f"{command}\r".encode('ascii')
@@ -98,7 +120,66 @@ class ELM327Connection(ABC):
             
             self._last_activity = time.monotonic()
             
+            if response:  # Got a real response — reset timeout counter
+                self._consecutive_timeouts = 0
+            else:
+                self._consecutive_timeouts += 1
+                self._total_timeouts += 1
+                logger.warning(
+                    f"Empty response for '{command}' "
+                    f"(consecutive timeouts: {self._consecutive_timeouts}/{self.MAX_CONSECUTIVE_TIMEOUTS})"
+                )
+                if self._consecutive_timeouts >= self.MAX_CONSECUTIVE_TIMEOUTS:
+                    logger.error(
+                        f"Adapter unresponsive after {self._consecutive_timeouts} consecutive timeouts. "
+                        f"Forcing reconnect..."
+                    )
+                    await self._force_reconnect()
+            
             return response
+        finally:
+            self._lock.release()
+    
+    async def _flush_read_buffer(self):
+        """Drain any stale bytes from the read buffer before sending a new command."""
+        if not self._reader:
+            return
+        drained = 0
+        try:
+            while True:
+                chunk = await asyncio.wait_for(self._reader.read(4096), timeout=0.1)
+                if not chunk:
+                    break
+                drained += len(chunk)
+        except asyncio.TimeoutError:
+            pass
+        if drained:
+            logger.info(f"Flushed {drained} stale bytes from read buffer")
+    
+    async def _force_reconnect(self):
+        """Force-close and reopen the connection to recover from stuck adapter."""
+        logger.warning("Force-reconnecting adapter...")
+        try:
+            if self._writer:
+                self._writer.close()
+                try:
+                    await asyncio.wait_for(self._writer.wait_closed(), timeout=2.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+            self._writer = None
+            self._reader = None
+            self._connected = False
+            
+            # Subclasses (SerialConnection, WiFiConnection) override connect()
+            # to reopen the port. We call it to re-establish.
+            success = await self.connect()
+            if success:
+                self._consecutive_timeouts = 0
+                logger.info("Force-reconnect successful — adapter recovered")
+            else:
+                logger.error("Force-reconnect FAILED — adapter may need manual restart")
+        except Exception as e:
+            logger.error(f"Force-reconnect error: {e}")
     
     async def _read_until_prompt(self, timeout: float) -> str:
         """Read response until ELM327 prompt (>)."""
@@ -118,7 +199,9 @@ class ELM327Connection(ABC):
                 if b">" in buffer:
                     break
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout reading response, got: {buffer}")
+            self._consecutive_timeouts += 1
+            self._total_timeouts += 1
+            logger.warning(f"Timeout reading response (consecutive: {self._consecutive_timeouts}), got: {buffer}")
         
         # Decode and clean response
         response = buffer.decode('ascii', errors='ignore')

@@ -1387,6 +1387,81 @@ async def trigger_update_check():
     }
 
 
+@app.post("/restart")
+async def restart_gateway():
+    """Remotely restart the gateway process.
+
+    The process exits cleanly; the Windows scheduled task / wrapper script
+    will relaunch it.  This also forces the serial port to close and
+    reopen, recovering from stuck adapter states.
+    """
+    logger.warning("🔄 Remote restart requested — shutting down in 2s")
+
+    async def _do_restart():
+        await asyncio.sleep(2)   # Let the HTTP response go out
+        logger.info("Exiting for restart...")
+        os._exit(42)             # Non-zero so wrapper knows it's intentional
+
+    asyncio.create_task(_do_restart())
+    return {
+        "status": "restarting",
+        "message": "Gateway will restart in ~2 seconds",
+    }
+
+
+@app.post("/reconnect-adapter")
+async def reconnect_adapter():
+    """Force-close and reopen the serial connection to the ELM327 adapter.
+
+    Unlike ``/reset-adapter`` (which sends ATZ through the existing
+    connection and can hang if the serial port itself is stuck), this
+    tears down the serial/Bluetooth link entirely and reconnects from
+    scratch.
+    """
+    global _elm, _connected_at
+    _require_connection()
+
+    _stop_keepalive()
+    logger.warning("🔌 Force-reconnecting adapter (closing serial port)...")
+
+    try:
+        conn = _elm._connection
+        address = conn.config.address
+        conn_type = conn.config.connection_type.value
+
+        # Force-close the old connection
+        try:
+            await asyncio.wait_for(conn.disconnect(), timeout=3.0)
+        except Exception as e:
+            logger.warning(f"Disconnect error (ignored): {e}")
+
+        # Small delay for serial port to release
+        await asyncio.sleep(1.5)
+
+        # Reconnect
+        _elm = ELM327Service()
+        success = await _elm.connect(conn_type, address)
+        if success:
+            _connected_at = datetime.now()
+            _start_keepalive()
+            logger.info("✅ Adapter reconnected successfully")
+            return {
+                "status": "reconnected",
+                "vin": _elm.vin,
+                "timestamp": datetime.now().isoformat(),
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail="Reconnect failed - adapter may need manual power cycle",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reconnect error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # =============================================================================
 # Session Endpoints
 # =============================================================================
