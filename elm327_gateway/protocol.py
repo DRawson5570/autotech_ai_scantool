@@ -1283,28 +1283,39 @@ class OBDProtocol:
             return True
         return False
 
+    @staticmethod
+    def _is_standard_obd_addr(module_addr: int) -> bool:
+        """Check if address is in the standard OBD-II range (0x7E0-0x7E7).
+
+        The ELM327/STN auto-FC only handles these addresses automatically.
+        Any other address (GM enhanced 0x2XX, Ford MS-CAN 0x7XX, etc.)
+        needs explicit Flow Control configuration for multi-frame responses.
+        """
+        return 0x7E0 <= module_addr <= 0x7E7
+
     async def _configure_can_target(
         self,
         module_addr: int,
         resp_addr: int,
         switched_bus: bool,
-    ) -> None:
+    ) -> bool:
         """Set up CAN headers, receive filter, and Flow Control.
 
-        For User protocols (SW-CAN/STP63, MS-CAN/STP33) the adapter's
-        auto-FC doesn't know the correct header to send, so multi-frame
-        ISO-TP responses fail — the ECU sends a First Frame, never
-        receives a Flow Control, and the Consecutive Frames never come.
+        Configures explicit FC in two cases:
+        1. User protocols (SW-CAN/STP63, MS-CAN/STP33) — the adapter's
+           auto-FC doesn't know the correct header.
+        2. Non-standard addresses on HS-CAN (e.g. GM enhanced 0x243,
+           0x24C) — auto-FC only handles 0x7E0-0x7E7.
 
-        This method explicitly configures FC for User protocols so multi-
-        frame works on every bus.
+        Returns True if explicit FC was configured (caller must restore).
         """
         await self.connection.send_command("ATH1")
         await self.connection.send_command(f"ATSH{module_addr:03X}")
         await self.connection.send_command(f"ATCRA{resp_addr:03X}")
 
-        if switched_bus:
-            # Explicit Flow Control for User protocols:
+        need_fc = switched_bus or not self._is_standard_obd_addr(module_addr)
+        if need_fc:
+            # Explicit Flow Control:
             #   FC SH  = our transmit header (module_addr)
             #   FC SD  = 30 00 00: FlowStatus=CTS, BlockSize=0, STmin=0
             #   FC SM 1 = user-defined header + data
@@ -1315,18 +1326,28 @@ class OBDProtocol:
             await self.connection.send_command("AT FC SM 1")
             logger.info(
                 f"Configured explicit FC: header={module_addr:03X}, "
-                f"CTS/BS=0/STmin=0"
+                f"CTS/BS=0/STmin=0 (bus_switched={switched_bus}, "
+                f"non_standard_addr={not self._is_standard_obd_addr(module_addr)})"
             )
+        return need_fc
 
-    async def _restore_can_defaults(self, switched_bus: bool) -> None:
-        """Restore adapter to default HS-CAN state after a request."""
-        if switched_bus:
-            # Restore FC to auto mode BEFORE switching protocol back,
-            # since FC SM 0 is protocol-independent.
+    async def _restore_can_defaults(
+        self, switched_bus: bool, explicit_fc: bool = False
+    ) -> None:
+        """Restore adapter to default HS-CAN state after a request.
+
+        Args:
+            switched_bus: True if we switched away from HS-CAN.
+            explicit_fc: True if explicit Flow Control was configured
+                         (non-standard addr or non-HS-CAN bus).
+        """
+        if explicit_fc:
+            # Restore FC to auto mode — must happen before protocol switch
             try:
                 await self.connection.send_command("AT FC SM 0")
             except Exception:
                 pass
+        if switched_bus:
             for cmd in ["STP6", "STPC1"]:
                 try:
                     await self.connection.send_command(cmd)
@@ -1597,10 +1618,11 @@ class OBDProtocol:
             DID value as string (ASCII if printable, hex otherwise), or None
         """
         switched_bus = False
+        explicit_fc = False
         try:
             switched_bus = await self._switch_bus(bus)
             resp_addr = self._resolve_response_addr(module_addr)
-            await self._configure_can_target(module_addr, resp_addr, switched_bus)
+            explicit_fc = await self._configure_can_target(module_addr, resp_addr, switched_bus)
             
             # UDS Service 0x22: ReadDataByIdentifier
             cmd = f"22{did:04X}"
@@ -1647,7 +1669,7 @@ class OBDProtocol:
             logger.error(f"read_did({module_addr:03X}, {did:04X}) failed: {e}")
             return None
         finally:
-            await self._restore_can_defaults(switched_bus)
+            await self._restore_can_defaults(switched_bus, explicit_fc)
 
     async def send_uds_raw(
         self,
@@ -1670,10 +1692,11 @@ class OBDProtocol:
             Raw hex response string (e.g. "6FDE0003FF"), or empty string on failure.
         """
         switched_bus = False
+        explicit_fc = False
         try:
             switched_bus = await self._switch_bus(bus)
             resp_addr = self._resolve_response_addr(module_addr)
-            await self._configure_can_target(module_addr, resp_addr, switched_bus)
+            explicit_fc = await self._configure_can_target(module_addr, resp_addr, switched_bus)
 
             # Send the raw UDS command
             resp = await self.connection.send_command(hex_cmd, timeout=5.0)
@@ -1693,7 +1716,7 @@ class OBDProtocol:
             logger.error(f"send_uds_raw({module_addr:03X}, {hex_cmd}) failed: {e}")
             return ""
         finally:
-            await self._restore_can_defaults(switched_bus)
+            await self._restore_can_defaults(switched_bus, explicit_fc)
 
     async def read_dids(
         self,
@@ -1714,10 +1737,11 @@ class OBDProtocol:
         """
         results = {}
         switched_bus = False
+        explicit_fc = False
         try:
             switched_bus = await self._switch_bus(bus)
             resp_addr = self._resolve_response_addr(module_addr)
-            await self._configure_can_target(module_addr, resp_addr, switched_bus)
+            explicit_fc = await self._configure_can_target(module_addr, resp_addr, switched_bus)
 
             resp_hex_str = f"{resp_addr:03X}"
             for did in dids:
@@ -1761,7 +1785,7 @@ class OBDProtocol:
         except Exception as e:
             logger.error(f"read_dids({module_addr:03X}) failed: {e}")
         finally:
-            await self._restore_can_defaults(switched_bus)
+            await self._restore_can_defaults(switched_bus, explicit_fc)
         
         return results
 
