@@ -20,7 +20,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,17 @@ class DTC:
     code: str  # e.g., "P0171"
     status: str = "stored"  # stored, pending, permanent
     description: str = ""
+    # UDS 0x19 status byte fields (ISO 14229-1 Table D.3)
+    status_byte: Optional[int] = None  # Raw status byte
+    test_failed: bool = False           # Bit 0: DTC test failed at time of request
+    test_failed_this_op: bool = False   # Bit 1: DTC test failed this operation cycle
+    pending: bool = False               # Bit 2: Pending DTC (failed once, not confirmed)
+    confirmed: bool = False             # Bit 3: Confirmed DTC (MIL, matured)
+    test_not_completed_since_clear: bool = False  # Bit 4
+    test_failed_since_clear: bool = False          # Bit 5
+    test_not_completed_this_op: bool = False       # Bit 6
+    warning_indicator_requested: bool = False       # Bit 7: MIL requested
+    source_module: str = ""  # e.g. "PCM", "TCM" — from UDS 0x19 per-module query
     
     @property
     def type(self) -> DTCType:
@@ -66,6 +77,28 @@ class DTC:
         if len(self.code) >= 2:
             return self.code[1] in ('1', '3')
         return False
+    
+    @property
+    def status_flags(self) -> List[str]:
+        """Return human-readable list of active status flags."""
+        flags = []
+        if self.test_failed:
+            flags.append("testFailed")
+        if self.test_failed_this_op:
+            flags.append("testFailedThisOp")
+        if self.pending:
+            flags.append("pending")
+        if self.confirmed:
+            flags.append("confirmed")
+        if self.test_not_completed_since_clear:
+            flags.append("testNotCompletedSinceClear")
+        if self.test_failed_since_clear:
+            flags.append("testFailedSinceClear")
+        if self.test_not_completed_this_op:
+            flags.append("testNotCompletedThisOp")
+        if self.warning_indicator_requested:
+            flags.append("warningIndicator")
+        return flags
 
 
 @dataclass
@@ -704,7 +737,634 @@ class OBDProtocol:
             List of DTC objects
         """
         return await self._read_dtcs_all_modules("0A", "permanent")
-    
+
+    # -------------------------------------------------------------------------
+    # Mode $05: O2 Sensor Monitoring Test Results
+    # -------------------------------------------------------------------------
+
+    # O2 monitor Test IDs (TIDs) per SAE J1979 Table A-6
+    _O2_TEST_IDS: Dict[int, Dict[str, str]] = {
+        0x01: {"name": "Rich-to-lean threshold voltage", "unit": "V", "formula": "val * 0.005"},
+        0x02: {"name": "Lean-to-rich threshold voltage", "unit": "V", "formula": "val * 0.005"},
+        0x03: {"name": "Low voltage for switch time", "unit": "V", "formula": "val * 0.005"},
+        0x04: {"name": "High voltage for switch time", "unit": "V", "formula": "val * 0.005"},
+        0x05: {"name": "Rich-to-lean switch time", "unit": "ms", "formula": "val * 0.004"},
+        0x06: {"name": "Lean-to-rich switch time", "unit": "ms", "formula": "val * 0.004"},
+        0x07: {"name": "Minimum voltage for test", "unit": "V", "formula": "val * 0.005"},
+        0x08: {"name": "Maximum voltage for test", "unit": "V", "formula": "val * 0.005"},
+        0x09: {"name": "Time between voltage transitions", "unit": "ms", "formula": "val * 0.004"},
+    }
+
+    # O2 sensor locations mapped by TID high nibble
+    # TIDs $01-$09: Bank 1 Sensor 1
+    # TIDs $01+$10 to $09+$10: Bank 1 Sensor 2, etc.
+    _O2_SENSOR_LOCATIONS: Dict[int, str] = {
+        0x00: "Bank 1, Sensor 1",
+        0x10: "Bank 1, Sensor 2",
+        0x20: "Bank 2, Sensor 1",
+        0x30: "Bank 2, Sensor 2",
+        0x40: "Bank 3, Sensor 1",
+        0x50: "Bank 3, Sensor 2",
+        0x60: "Bank 4, Sensor 1",
+        0x70: "Bank 4, Sensor 2",
+    }
+
+    async def read_o2_monitoring(self) -> Dict[str, Any]:
+        """
+        Read Mode $05 O2 sensor monitoring test results.
+
+        Returns a dict keyed by sensor location with test results for each,
+        including pass/fail status based on min/max thresholds.
+
+        ISO 15031-5 / SAE J1979 Mode $05.
+        Standard CAN uses $06 for this data on newer vehicles, but Mode $05
+        is the correct service for pre-2008 / non-CAN O2 monitoring.
+
+        Returns:
+            {
+                "Bank 1, Sensor 1": [
+                    {
+                        "test": "Rich-to-lean threshold voltage",
+                        "value": 0.450,
+                        "min": 0.000,
+                        "max": 0.999,
+                        "unit": "V",
+                        "passed": True
+                    },
+                    ...
+                ],
+                ...
+            }
+        """
+        logger.info("Reading Mode $05 O2 sensor monitoring data")
+        results: Dict[str, List[Dict[str, Any]]] = {}
+
+        # First check which TIDs are supported
+        supported_tids = await self._get_supported_o2_tids()
+        if not supported_tids:
+            logger.info("No Mode $05 O2 monitoring TIDs supported (may be CAN-only vehicle using Mode $06)")
+            return results
+
+        for tid in supported_tids:
+            try:
+                # Determine which base test and sensor this maps to
+                base_test = tid & 0x0F  # low nibble = test type
+                sensor_offset = tid & 0xF0  # high nibble = sensor location
+
+                if base_test == 0 or base_test > 9:
+                    continue  # Skip support PIDs and reserved
+
+                test_info = self._O2_TEST_IDS.get(base_test)
+                if not test_info:
+                    continue
+
+                sensor_name = self._O2_SENSOR_LOCATIONS.get(sensor_offset, f"Unknown sensor 0x{sensor_offset:02X}")
+
+                # Send Mode 05 TID XX
+                resp = await self._send_command(f"05{tid:02X}")
+                parsed = self._parse_o2_test_result(resp, test_info, tid)
+
+                if parsed:
+                    if sensor_name not in results:
+                        results[sensor_name] = []
+                    results[sensor_name].append(parsed)
+
+            except Exception as e:
+                logger.debug(f"Mode $05 TID 0x{tid:02X} failed: {e}")
+                continue
+
+        logger.info(f"Mode $05: {sum(len(v) for v in results.values())} test results from {len(results)} sensors")
+        return results
+
+    async def _get_supported_o2_tids(self) -> List[int]:
+        """
+        Query Mode $05 supported TIDs via the bitmask PID $0100.
+
+        The support encoding follows the same pattern as Mode $01 PID support:
+        TID $00 returns a 4-byte bitmask of TIDs $01–$20.
+        """
+        supported: List[int] = []
+
+        try:
+            resp = await self._send_command("0500")
+            if not resp:
+                return supported
+
+            # Parse response: expect "45 00 XX XX XX XX"
+            clean = self._clean_response(resp)
+            if not clean:
+                return supported
+
+            # Find the response bytes after "45 00"
+            parts = clean.split()
+            # Look for "45" response
+            idx = -1
+            for i, p in enumerate(parts):
+                if p.upper() == "45":
+                    idx = i
+                    break
+
+            if idx < 0 or idx + 5 >= len(parts) + 1:
+                # Try alternate parse: just take 4 bytes after expected header
+                if len(parts) >= 6:
+                    idx = 0
+                else:
+                    return supported
+
+            # Parse 4-byte bitmask
+            try:
+                bitmask_bytes = parts[idx + 2: idx + 6]
+                bitmask = int("".join(bitmask_bytes), 16)
+            except (ValueError, IndexError):
+                return supported
+
+            # Decode bitmask: bit 31 = TID $01, bit 30 = TID $02, etc.
+            for bit in range(32):
+                if bitmask & (1 << (31 - bit)):
+                    supported.append(bit + 1)
+
+            logger.debug(f"Mode $05 supported TIDs: {[f'0x{t:02X}' for t in supported]}")
+
+        except Exception as e:
+            logger.debug(f"Mode $05 TID support query failed: {e}")
+
+        return supported
+
+    def _parse_o2_test_result(
+        self,
+        response: str,
+        test_info: Dict[str, str],
+        tid: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Parse a Mode $05 response for a single O2 test.
+
+        Response format (SAE J1979):
+            45 TT LL LL HH HH VV VV
+            TT = Test ID
+            LL LL = Minimum test limit (2 bytes)
+            HH HH = Maximum test limit (2 bytes)  
+            VV VV = Test value (2 bytes)
+
+        Some ECUs return abbreviated responses; we handle gracefully.
+        """
+        if not response:
+            return None
+
+        clean = self._clean_response(response)
+        if not clean:
+            return None
+
+        parts = clean.split()
+
+        # Find response header "45"
+        idx = -1
+        for i, p in enumerate(parts):
+            if p.upper() == "45":
+                idx = i
+                break
+
+        if idx < 0:
+            return None
+
+        # Need at least 7 bytes after "45": TT LL LL HH HH VV VV
+        remaining = parts[idx + 1:]
+        if len(remaining) < 7:
+            # Some ECUs return just TT VV VV (abbreviated)
+            if len(remaining) >= 3:
+                try:
+                    raw_value = int(remaining[1] + remaining[2], 16)
+                    value = self._apply_o2_formula(raw_value, test_info["formula"])
+                    return {
+                        "test": test_info["name"],
+                        "tid": f"0x{tid:02X}",
+                        "value": round(value, 4),
+                        "min": None,
+                        "max": None,
+                        "unit": test_info["unit"],
+                        "passed": None,  # Can't determine without limits
+                    }
+                except (ValueError, IndexError):
+                    return None
+            return None
+
+        try:
+            min_raw = int(remaining[1] + remaining[2], 16)
+            max_raw = int(remaining[3] + remaining[4], 16)
+            val_raw = int(remaining[5] + remaining[6], 16)
+
+            min_val = self._apply_o2_formula(min_raw, test_info["formula"])
+            max_val = self._apply_o2_formula(max_raw, test_info["formula"])
+            value = self._apply_o2_formula(val_raw, test_info["formula"])
+
+            passed = min_val <= value <= max_val if min_val <= max_val else True
+
+            return {
+                "test": test_info["name"],
+                "tid": f"0x{tid:02X}",
+                "value": round(value, 4),
+                "min": round(min_val, 4),
+                "max": round(max_val, 4),
+                "unit": test_info["unit"],
+                "passed": passed,
+            }
+        except (ValueError, IndexError) as e:
+            logger.debug(f"Failed to parse Mode $05 TID 0x{tid:02X}: {e}")
+            return None
+
+    @staticmethod
+    def _apply_o2_formula(val: int, formula: str) -> float:
+        """Apply a scaling formula to a raw O2 test value."""
+        # The formula is a simple Python expression with 'val' as the variable
+        try:
+            return float(eval(formula, {"__builtins__": {}}, {"val": val}))
+        except Exception:
+            return float(val)
+
+    # -------------------------------------------------------------------------
+    # UDS 0x19: ReadDTCInformation (ISO 14229-1)
+    # -------------------------------------------------------------------------
+
+    def _parse_dtc_status_byte(self, status_byte: int) -> Dict[str, bool]:
+        """Parse UDS DTC status byte (ISO 14229-1 Table D.3) into flag dict."""
+        return {
+            "test_failed": bool(status_byte & 0x01),
+            "test_failed_this_op": bool(status_byte & 0x02),
+            "pending": bool(status_byte & 0x04),
+            "confirmed": bool(status_byte & 0x08),
+            "test_not_completed_since_clear": bool(status_byte & 0x10),
+            "test_failed_since_clear": bool(status_byte & 0x20),
+            "test_not_completed_this_op": bool(status_byte & 0x40),
+            "warning_indicator_requested": bool(status_byte & 0x80),
+        }
+
+    async def read_dtc_info(
+        self,
+        module_addr: int = 0x7E0,
+        bus: str = "HS-CAN",
+        status_mask: int = 0xFF,
+    ) -> List[DTC]:
+        """
+        Read DTCs with full UDS status bytes via service 0x19 sub-function 0x02.
+        
+        This is the UDS-native DTC reading method — far richer than OBD-II
+        Modes $03/$07/$0A. Returns per-DTC status byte with 8 individual flags
+        describing the exact lifecycle state of each fault:
+        - testFailed, pending, confirmed, warningIndicator (MIL), etc.
+        
+        ISO 14229-1 §D.2: reportDTCByStatusMask
+        Request:  19 02 <statusMask>
+        Response: 59 02 <availabilityMask> {<dtcHighByte> <dtcMidByte> <dtcLowByte> <statusByte>}*
+        
+        Args:
+            module_addr: CAN request address (e.g. 0x7E0 for PCM, 0x760 for GEM)
+            bus: "HS-CAN", "MS-CAN", or "SW-CAN"
+            status_mask: Bitmask of DTC statuses to request (0xFF = all)
+                         0x01=testFailed, 0x04=pending, 0x08=confirmed, etc.
+        
+        Returns:
+            List of DTC objects with full status byte breakdown
+        """
+        dtcs = []
+        switched_bus = False
+        explicit_fc = False
+        try:
+            switched_bus = await self._switch_bus(bus)
+            resp_addr = self._resolve_response_addr(module_addr)
+            explicit_fc = await self._configure_can_target(
+                module_addr, resp_addr, switched_bus
+            )
+
+            # Enter extended diagnostic session for wider DTC access
+            try:
+                await self.connection.send_command("1003", timeout=3.0)
+            except Exception:
+                pass
+
+            # UDS 0x19 sub 0x02: reportDTCByStatusMask
+            cmd = f"1902{status_mask:02X}"
+            resp = await self.connection.send_command(cmd, timeout=8.0)
+
+            if not resp or not self._is_live_response(resp):
+                logger.info(
+                    f"UDS 0x19 from {module_addr:03X}: no response"
+                )
+                return dtcs
+
+            # Reassemble ISO-TP multi-frame response
+            resp_hex = f"{resp_addr:03X}"
+            cleaned = self._reassemble_isotp(resp, resp_hex)
+
+            # Check for negative response (7F 19 xx)
+            if "7F19" in cleaned.upper():
+                nrc_idx = cleaned.upper().find("7F19") + 4
+                nrc = cleaned[nrc_idx:nrc_idx + 2] if nrc_idx + 2 <= len(cleaned) else "??"
+                nrc_name = get_nrc_name_hex(nrc)
+                logger.info(
+                    f"UDS 0x19 from {module_addr:03X}: negative response ({nrc_name})"
+                )
+                return dtcs
+
+            # Parse positive response: 59 02 <availabilityMask> {DTC3 + status1}*
+            marker = "5902"
+            idx = cleaned.upper().find(marker)
+            if idx < 0:
+                logger.info(f"UDS 0x19 from {module_addr:03X}: unexpected response")
+                return dtcs
+
+            # Skip 59 02 <availabilityMask> = 6 hex chars
+            data = cleaned[idx + 6:]
+
+            # Resolve module name for source attribution
+            module_name = ""
+            # Check standard OBD-II addresses
+            if resp_addr in ECU_ADDRESSES:
+                module_name = ECU_ADDRESSES[resp_addr]["name"]
+            elif resp_addr in FORD_MS_CAN_ADDRESSES:
+                module_name = FORD_MS_CAN_ADDRESSES[resp_addr]["name"]
+            elif resp_addr in GM_ENHANCED_ADDRESSES:
+                module_name = GM_ENHANCED_ADDRESSES[resp_addr]["name"]
+
+            # Each DTC record is 8 hex chars: 3 bytes DTC + 1 byte status
+            for i in range(0, len(data) - 7, 8):
+                try:
+                    dtc_high = data[i:i + 2]
+                    dtc_mid = data[i + 2:i + 4]
+                    dtc_low = data[i + 4:i + 6]
+                    status_hex = data[i + 6:i + 8]
+
+                    # Skip empty entries
+                    if dtc_high == "00" and dtc_mid == "00" and dtc_low == "00":
+                        continue
+
+                    # UDS DTC format: 3 bytes encode the standard P/C/B/U code
+                    # Byte 1 high nibble = type+digit1, same as OBD-II encoding
+                    raw_hex = dtc_high + dtc_mid[0]  # First 3 nibbles for decode
+                    # But UDS gives us 3 full bytes — re-encode to 2-byte OBD format
+                    # Actually UDS DTCs use the same encoding: high byte = type+digit1+digit2
+                    # So bytes 1-2 are the OBD-II 2-byte DTC, byte 3 is the failure type byte
+                    dtc_code = self._decode_dtc(dtc_high + dtc_mid)
+                    if not dtc_code:
+                        continue
+
+                    # Append failure type byte as sub-code if non-zero
+                    failure_type = int(dtc_low, 16)
+                    if failure_type > 0:
+                        dtc_code_full = f"{dtc_code}-{failure_type:02X}"
+                    else:
+                        dtc_code_full = dtc_code
+
+                    # Parse status byte
+                    sb = int(status_hex, 16)
+                    flags = self._parse_dtc_status_byte(sb)
+
+                    # Determine status label from flags
+                    if flags["confirmed"]:
+                        status_label = "confirmed"
+                    elif flags["pending"]:
+                        status_label = "pending"
+                    elif flags["test_failed"]:
+                        status_label = "active"
+                    else:
+                        status_label = "history"
+
+                    dtc = DTC(
+                        code=dtc_code_full,
+                        status=status_label,
+                        description=f"[{module_name}]" if module_name else "",
+                        status_byte=sb,
+                        source_module=module_name,
+                        **flags,
+                    )
+                    dtcs.append(dtc)
+                    logger.info(
+                        f"UDS DTC: {dtc_code_full} status=0x{sb:02X} "
+                        f"({', '.join(dtc.status_flags)}) from {module_name}"
+                    )
+
+                except Exception as e:
+                    logger.debug(f"Error parsing UDS DTC at position {i}: {e}")
+
+        except Exception as e:
+            logger.error(f"read_dtc_info({module_addr:03X}) failed: {e}")
+        finally:
+            await self._restore_can_defaults(switched_bus, explicit_fc)
+
+        return dtcs
+
+    async def read_dtc_info_all_modules(
+        self,
+        modules: Optional[List['ECUModule']] = None,
+        status_mask: int = 0xFF,
+    ) -> List[DTC]:
+        """
+        Read UDS DTCs from ALL previously discovered modules.
+        
+        Queries each module individually with UDS 0x19 and aggregates
+        the results. Falls back to standard OBD-II modes if the module
+        doesn't support UDS 0x19.
+        
+        Args:
+            modules: List of ECUModule objects (from discover_modules()).
+                     If None, probes standard addresses 0x7E0-0x7E7.
+            status_mask: UDS status mask (0xFF = all DTCs)
+        
+        Returns:
+            Combined list of DTC objects from all modules
+        """
+        all_dtcs = []
+
+        if modules is None:
+            # Probe standard OBD-II addresses
+            probe_list = [
+                (addr_info["request"], "HS-CAN")
+                for addr_info in ECU_ADDRESSES.values()
+            ]
+        else:
+            probe_list = [
+                (m.request_addr, m.bus) for m in modules
+            ]
+
+        for req_addr, bus in probe_list:
+            try:
+                module_dtcs = await self.read_dtc_info(
+                    module_addr=req_addr, bus=bus, status_mask=status_mask
+                )
+                all_dtcs.extend(module_dtcs)
+            except Exception as e:
+                logger.debug(f"UDS 0x19 failed for {req_addr:03X}: {e}")
+
+        # Deduplicate by DTC code (same DTC may come from broadcast + targeted)
+        seen = set()
+        unique_dtcs = []
+        for dtc in all_dtcs:
+            key = (dtc.code, dtc.source_module)
+            if key not in seen:
+                seen.add(key)
+                unique_dtcs.append(dtc)
+
+        logger.info(
+            f"UDS 0x19 total: {len(unique_dtcs)} DTCs from "
+            f"{len(probe_list)} modules"
+        )
+        return unique_dtcs
+
+    async def read_dtc_snapshot(
+        self,
+        module_addr: int,
+        dtc_code: str,
+        bus: str = "HS-CAN",
+        record_number: int = 0xFF,
+    ) -> Dict[str, str]:
+        """
+        Read DTC snapshot (freeze frame) data for a specific DTC via UDS 0x19 sub 0x04.
+        
+        This is the UDS-native freeze frame — returns the snapshot recorded by
+        the ECU at the moment the DTC was set. Much richer than Mode $02.
+        
+        ISO 14229-1 §D.4: reportDTCSnapshotRecordByDTCNumber
+        Request:  19 04 <dtcHigh> <dtcMid> <dtcLow> <recordNumber>
+        Response: 59 04 <dtcHigh> <dtcMid> <dtcLow> <statusByte> <recordNumber> <snapshotData...>
+        
+        Args:
+            module_addr: CAN request address
+            dtc_code: DTC code string (e.g. "P0171" or "P0171-1A")
+            bus: Bus to use
+            record_number: Snapshot record number (0xFF = all records)
+        
+        Returns:
+            Dict of snapshot DID label → value string
+        """
+        snapshot = {}
+        switched_bus = False
+        explicit_fc = False
+        try:
+            # Encode DTC code back to 3-byte UDS format
+            dtc_bytes = self._encode_dtc_to_uds(dtc_code)
+            if not dtc_bytes:
+                logger.warning(f"Cannot encode DTC '{dtc_code}' to UDS format")
+                return snapshot
+
+            switched_bus = await self._switch_bus(bus)
+            resp_addr = self._resolve_response_addr(module_addr)
+            explicit_fc = await self._configure_can_target(
+                module_addr, resp_addr, switched_bus
+            )
+
+            # Extended session
+            try:
+                await self.connection.send_command("1003", timeout=3.0)
+            except Exception:
+                pass
+
+            # UDS 0x19 sub 0x04
+            cmd = f"1904{dtc_bytes}{record_number:02X}"
+            resp = await self.connection.send_command(cmd, timeout=8.0)
+
+            if not resp or not self._is_live_response(resp):
+                return snapshot
+
+            resp_hex = f"{resp_addr:03X}"
+            cleaned = self._reassemble_isotp(resp, resp_hex)
+
+            # Check for NRC
+            if "7F19" in cleaned.upper():
+                return snapshot
+
+            # Parse: 59 04 <DTC3> <status1> <recNum1> <data...>
+            marker = "5904"
+            idx = cleaned.upper().find(marker)
+            if idx < 0:
+                return snapshot
+
+            # Skip 59 04 + DTC(6) + status(2) + recNum(2) = 14 hex chars
+            data = cleaned[idx + 14:]
+
+            # Snapshot data is a sequence of DID(2 bytes) + value pairs
+            # We'll decode what we can
+            pos = 0
+            while pos + 4 <= len(data):
+                did_hex = data[pos:pos + 4]
+                try:
+                    did_int = int(did_hex, 16)
+                except ValueError:
+                    break
+                pos += 4
+
+                # Read until next DID or end — heuristic: 2-8 bytes per DID
+                # We'll take up to the next recognizable DID or end of data
+                value_hex = ""
+                while pos < len(data):
+                    # Peek ahead to see if next 4 chars look like a DID
+                    if pos + 4 <= len(data):
+                        next_chunk = data[pos:pos + 4]
+                        try:
+                            next_did = int(next_chunk, 16)
+                            # If it looks like a known DID range, this is the next DID
+                            if next_did in STANDARD_DIDS or (0xF400 <= next_did <= 0xF8FF):
+                                break
+                        except ValueError:
+                            pass
+                    value_hex += data[pos:pos + 2]
+                    pos += 2
+
+                # Decode value
+                label = STANDARD_DIDS.get(did_int, f"DID_0x{did_int:04X}")
+                if value_hex:
+                    try:
+                        value_bytes = bytes.fromhex(value_hex)
+                        snapshot[label] = self._decode_did_value(value_bytes)
+                    except ValueError:
+                        snapshot[label] = value_hex
+
+        except Exception as e:
+            logger.error(f"read_dtc_snapshot({module_addr:03X}, {dtc_code}) failed: {e}")
+        finally:
+            await self._restore_can_defaults(switched_bus, explicit_fc)
+
+        return snapshot
+
+    def _encode_dtc_to_uds(self, dtc_code: str) -> Optional[str]:
+        """
+        Encode a DTC string (e.g. "P0171" or "P0171-1A") to 3-byte UDS hex.
+        
+        Returns 6 hex characters (3 bytes) or None if invalid.
+        """
+        # Strip failure type suffix if present
+        base_code = dtc_code.split("-")[0]
+        failure_type = "00"
+        if "-" in dtc_code:
+            ft = dtc_code.split("-")[1]
+            if len(ft) == 2:
+                failure_type = ft
+
+        if len(base_code) != 5:
+            return None
+
+        prefix = base_code[0].upper()
+        digits = base_code[1:]
+
+        # Encode type prefix to first nibble
+        type_map = {
+            'P': {'0': 0x0, '1': 0x1, '2': 0x2, '3': 0x3},
+            'C': {'0': 0x4, '1': 0x5, '2': 0x6, '3': 0x7},
+            'B': {'0': 0x8, '1': 0x9, '2': 0xA, '3': 0xB},
+            'U': {'0': 0xC, '1': 0xD, '2': 0xE, '3': 0xF},
+        }
+
+        if prefix not in type_map or digits[0] not in type_map[prefix]:
+            return None
+
+        first_nibble = type_map[prefix][digits[0]]
+        # High byte = first_nibble + second digit
+        high_byte = (first_nibble << 4) | int(digits[1], 16)
+        # Mid byte = third + fourth digit
+        mid_byte = int(digits[2:4], 16)
+        # Low byte = failure type
+        low_byte = int(failure_type, 16)
+
+        return f"{high_byte:02X}{mid_byte:02X}{low_byte:02X}"
+
     # -------------------------------------------------------------------------
     # Module Discovery & Per-Module PID Enumeration
     # -------------------------------------------------------------------------

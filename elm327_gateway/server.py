@@ -262,6 +262,15 @@ class SniffLabelRequest(BaseModel):
     did: str
     label: str
 
+class DTCInfoRequest(BaseModel):
+    bus: str = "HS-CAN"
+    module_addr: Optional[str] = None  # None = all modules
+
+class DTCSnapshotRequest(BaseModel):
+    dtc_code: str  # e.g. "P0300"
+    module_addr: str = "0x7E0"
+    bus: str = "HS-CAN"
+
 
 # =============================================================================
 # FastAPI App
@@ -1325,6 +1334,162 @@ async def diagnostic_snapshot():
                 for name, r in snapshot.pids.items()
             }
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# UDS 0x19 ReadDTCInformation Endpoints
+# =============================================================================
+
+@app.get("/dtc-info")
+async def read_dtc_info_all(user_id: str = "default"):
+    """Read DTCs with UDS 0x19 from all discovered modules.
+
+    Returns enhanced DTC data including status bytes, confirmed/pending
+    flags, and source module for each DTC.
+    """
+    _require_connection()
+
+    try:
+        results = await _elm.read_dtc_info_all_modules()
+        session = get_session(user_id)
+
+        output = []
+        for item in results:
+            dtc_dict = {
+                "code": item["code"],
+                "description": item.get("description", ""),
+                "status_byte": item.get("status_byte"),
+                "confirmed": item.get("confirmed", False),
+                "pending": item.get("pending", False),
+                "warning_indicator": item.get("warning_indicator_requested", False),
+                "source_module": item.get("source_module", ""),
+            }
+            output.append(dtc_dict)
+            session.add_dtc(item["code"], item.get("description", ""))
+
+        return {"dtcs": output, "count": len(output)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dtc-info")
+async def read_dtc_info_module(req: DTCInfoRequest, user_id: str = "default"):
+    """Read DTCs from a specific module via UDS 0x19.
+
+    If module_addr is omitted, reads from all discovered modules.
+    """
+    _require_connection()
+
+    try:
+        if req.module_addr:
+            addr = req.module_addr.strip()
+            if addr.lower().startswith("0x"):
+                addr_int = int(addr, 16)
+            else:
+                addr_int = int(addr, 16) if len(addr) <= 4 else int(addr)
+
+            results = await _elm.read_dtc_info(
+                module_addr=addr_int,
+                bus=req.bus,
+            )
+        else:
+            results = await _elm.read_dtc_info_all_modules()
+
+        session = get_session(user_id)
+        output = []
+        for item in results:
+            dtc_dict = {
+                "code": item["code"],
+                "description": item.get("description", ""),
+                "status_byte": item.get("status_byte"),
+                "confirmed": item.get("confirmed", False),
+                "pending": item.get("pending", False),
+                "warning_indicator": item.get("warning_indicator_requested", False),
+                "source_module": item.get("source_module", ""),
+            }
+            output.append(dtc_dict)
+            session.add_dtc(item["code"], item.get("description", ""))
+
+        return {"dtcs": output, "count": len(output)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dtc-snapshot")
+async def read_dtc_snapshot(req: DTCSnapshotRequest, user_id: str = "default"):
+    """Read freeze-frame snapshot for a specific DTC via UDS 0x19 sub 0x04."""
+    _require_connection()
+
+    try:
+        addr = req.module_addr.strip()
+        if addr.lower().startswith("0x"):
+            addr_int = int(addr, 16)
+        else:
+            addr_int = int(addr, 16) if len(addr) <= 4 else int(addr)
+
+        snapshot = await _elm.read_dtc_snapshot(
+            dtc_code=req.dtc_code,
+            module_addr=addr_int,
+            bus=req.bus,
+        )
+
+        return {"dtc_code": req.dtc_code, "snapshot": snapshot}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Mode $05 O2 Monitoring Endpoint
+# =============================================================================
+
+@app.get("/o2-monitoring")
+async def read_o2_monitoring(user_id: str = "default"):
+    """Read Mode $05 O2 sensor monitoring test results.
+
+    Returns test IDs with measured values, min/max limits, and pass/fail
+    status for each O2 sensor.
+    """
+    _require_connection()
+
+    try:
+        results = await _elm.read_o2_monitoring()
+
+        return {
+            "tests": results,
+            "count": len(results),
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Network Topology Endpoint
+# =============================================================================
+
+@app.get("/topology", response_class=HTMLResponse)
+async def network_topology():
+    """Generate an interactive HTML network topology map of all discovered ECU modules."""
+    _require_connection()
+
+    try:
+        from .topology_map import render_topology_from_scan
+
+        modules = await _elm.discover_modules()
+        vin = None
+        try:
+            vin = await _elm.read_vin()
+        except Exception:
+            pass
+
+        html = render_topology_from_scan(modules, vin=vin)
+        return HTMLResponse(content=html)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

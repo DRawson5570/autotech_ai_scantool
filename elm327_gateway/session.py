@@ -100,6 +100,7 @@ class DiagnosticSession:
     vehicle_model: str = ""
     vehicle_engine: str = ""
     vehicle_vin: str = ""
+    vehicle_specs: Dict[str, str] = field(default_factory=dict)  # Full VPIC specs from VIN decode
     
     # Symptoms/complaints
     symptoms: List[str] = field(default_factory=list)
@@ -109,6 +110,13 @@ class DiagnosticSession:
     dtcs: List[DTCReading] = field(default_factory=list)
     pids: List[PIDReading] = field(default_factory=list)
     tests: List[TestResult] = field(default_factory=list)
+    
+    # NHTSA safety context (auto-populated when vehicle is identified)
+    nhtsa_complaint_count: int = 0
+    nhtsa_top_components: List[Dict[str, Any]] = field(default_factory=list)  # [{component, count, crashes, fires, deaths}]
+    nhtsa_recalls: List[Dict[str, str]] = field(default_factory=list)  # [{campaign_number, component, summary, consequence, remedy, park_it}]
+    nhtsa_safety_flags: Dict[str, Any] = field(default_factory=dict)  # {total_crashes, total_fires, total_deaths, total_injuries}
+    nhtsa_context_loaded: bool = False
     
     # Analysis
     hypotheses: List[Hypothesis] = field(default_factory=list)
@@ -224,6 +232,24 @@ class DiagnosticSession:
                 if info.get("engine_desc"):
                     self.vehicle_engine = info["engine_desc"]
                     logger.info(f"VIN decode → engine: {self.vehicle_engine}")
+                # Store full VPIC specs for enriched context
+                _SPEC_KEYS = [
+                    "valve_train", "engine_configuration", "engine_model",
+                    "engine_hp", "engine_power_kw", "turbo", "cooling_type",
+                    "displacement_l", "cylinders", "fuel_type",
+                    "drive_type", "transmission", "body_class",
+                    "electrification_level", "battery_type", "battery_kwh",
+                    "brake_system", "abs", "esc", "traction_control",
+                    "adaptive_cruise_control", "forward_collision_warning",
+                    "lane_departure_warning", "lane_keeping_assist",
+                    "blind_spot_warning", "backup_camera", "tpms_type",
+                ]
+                for key in _SPEC_KEYS:
+                    val = info.get(key)
+                    if val and str(val).strip():
+                        self.vehicle_specs[key] = str(val).strip()
+                if self.vehicle_specs:
+                    logger.info(f"VIN decode → {len(self.vehicle_specs)} specs stored")
             except Exception as e:
                 logger.debug(f"VIN full decode failed, falling back to WMI: {e}")
                 # Fallback: at least get make from local WMI table
@@ -255,6 +281,33 @@ class DiagnosticSession:
             self.tech_observations.append(observation)
             self.updated_at = datetime.now()
     
+    def set_nhtsa_context(self, complaint_count: int,
+                          top_components: List[Dict[str, Any]],
+                          recalls: List[Dict[str, str]],
+                          safety_flags: Dict[str, Any]):
+        """
+        Store NHTSA complaint/recall context for this vehicle.
+        
+        Called automatically when vehicle is identified (VIN decode or
+        make/model/year provided). Gives the LLM safety context before
+        it starts diagnosing.
+        
+        Args:
+            complaint_count: Total NHTSA complaints for this vehicle
+            top_components: Top complaint components with counts/severity
+            recalls: Active recalls with campaign numbers and details
+            safety_flags: Aggregate crash/fire/death/injury counts
+        """
+        self.nhtsa_complaint_count = complaint_count
+        self.nhtsa_top_components = top_components
+        self.nhtsa_recalls = recalls
+        self.nhtsa_safety_flags = safety_flags
+        self.nhtsa_context_loaded = True
+        self.updated_at = datetime.now()
+        logger.info(f"NHTSA context loaded: {complaint_count} complaints, "
+                     f"{len(recalls)} recalls, "
+                     f"{safety_flags.get('total_crashes', 0)} crashes")
+    
     def get_summary(self) -> str:
         """
         Generate a comprehensive summary for the LLM.
@@ -273,6 +326,56 @@ class DiagnosticSession:
         lines.append(f"\n🚗 **Vehicle:** {self.get_vehicle_description()}")
         if self.vehicle_vin:
             lines.append(f"   VIN: {self.vehicle_vin}")
+        if self.vehicle_specs:
+            specs = self.vehicle_specs
+            spec_parts = []
+            if specs.get("valve_train"):
+                spec_parts.append(f"Valve Train: {specs['valve_train']}")
+            if specs.get("engine_configuration"):
+                spec_parts.append(f"Config: {specs['engine_configuration']}")
+            if specs.get("engine_model"):
+                spec_parts.append(f"Engine: {specs['engine_model']}")
+            if specs.get("engine_hp"):
+                spec_parts.append(f"{specs['engine_hp']} hp")
+            if specs.get("turbo"):
+                spec_parts.append(f"Turbo: {specs['turbo']}")
+            if specs.get("drive_type"):
+                spec_parts.append(f"Drive: {specs['drive_type']}")
+            if specs.get("transmission"):
+                spec_parts.append(f"Trans: {specs['transmission']}")
+            if spec_parts:
+                lines.append(f"   Specs: {' · '.join(spec_parts)}")
+        
+        # NHTSA Safety Context
+        if self.nhtsa_context_loaded:
+            lines.append(f"\n⚠️ **NHTSA Safety Data** ({self.nhtsa_complaint_count:,} complaints on file)")
+            sf = self.nhtsa_safety_flags
+            if sf.get("total_crashes") or sf.get("total_fires") or sf.get("total_deaths"):
+                alert_parts = []
+                if sf.get("total_crashes"):
+                    alert_parts.append(f"{sf['total_crashes']:,} crashes")
+                if sf.get("total_fires"):
+                    alert_parts.append(f"{sf['total_fires']:,} fires")
+                if sf.get("total_deaths"):
+                    alert_parts.append(f"{sf['total_deaths']:,} deaths")
+                if sf.get("total_injuries"):
+                    alert_parts.append(f"{sf['total_injuries']:,} injuries")
+                lines.append(f"   🚨 Safety events: {', '.join(alert_parts)}")
+            if self.nhtsa_top_components:
+                comp_strs = [f"{c['component']} ({c['count']})" 
+                            for c in self.nhtsa_top_components[:5]]
+                lines.append(f"   Top complaint areas: {', '.join(comp_strs)}")
+            if self.nhtsa_recalls:
+                lines.append(f"   🔴 **{len(self.nhtsa_recalls)} Active Recall(s):**")
+                for r in self.nhtsa_recalls:
+                    park_flag = " 🅿️PARK IT" if r.get("park_it") == "Y" else ""
+                    lines.append(f"      • {r.get('campaign_number', 'N/A')}: "
+                                f"{r.get('component', 'Unknown')}{park_flag}")
+                    if r.get("summary"):
+                        summary = r["summary"]
+                        if len(summary) > 150:
+                            summary = summary[:147] + "..."
+                        lines.append(f"        {summary}")
         
         # Phase
         phase_emoji = {
@@ -378,7 +481,7 @@ class DiagnosticSession:
     
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
-        return {
+        d = {
             'session_id': self.session_id,
             'phase': self.phase.value,
             'vehicle': {
@@ -399,6 +502,14 @@ class DiagnosticSession:
             'tests_performed': len(self.tests),
             'next_steps': self.next_steps,
         }
+        if self.nhtsa_context_loaded:
+            d['nhtsa'] = {
+                'complaint_count': self.nhtsa_complaint_count,
+                'top_components': self.nhtsa_top_components,
+                'recalls': self.nhtsa_recalls,
+                'safety_flags': self.nhtsa_safety_flags,
+            }
+        return d
 
 
 # =============================================================================

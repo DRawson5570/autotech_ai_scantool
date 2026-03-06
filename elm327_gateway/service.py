@@ -374,7 +374,102 @@ class ELM327Service:
         self._ensure_connected()
         logger.warning("Clearing DTCs and freeze frame data")
         return await self._protocol.clear_dtcs()
-    
+
+    async def read_dtc_info(
+        self,
+        module_addr: int = 0x7E0,
+        bus: str = "HS-CAN",
+        status_mask: int = 0xFF,
+    ) -> List[DTC]:
+        """
+        Read DTCs with full UDS status bytes via service 0x19 sub 0x02.
+
+        Returns per-DTC status byte with 8 individual flags describing the
+        exact lifecycle state of each fault (testFailed, pending, confirmed,
+        warningIndicator, etc.).
+
+        Args:
+            module_addr: CAN request address (e.g. 0x7E0 for PCM)
+            bus: "HS-CAN", "MS-CAN", or "SW-CAN"
+            status_mask: Bitmask of DTC statuses to request (0xFF = all)
+
+        Returns:
+            List of DTC objects with full status byte breakdown
+        """
+        self._ensure_connected()
+        dtcs = await self._protocol.read_dtc_info(
+            module_addr=module_addr, bus=bus, status_mask=status_mask
+        )
+
+        # Enrich descriptions
+        for dtc in dtcs:
+            ecu_tag = dtc.description if dtc.description.startswith('[') else ''
+            desc = get_dtc_description(dtc.code.split('-')[0])
+            dtc.description = f"{desc} {ecu_tag}".strip()
+
+        logger.info(
+            f"UDS 0x19: {len(dtcs)} DTCs from {module_addr:#05X} on {bus}"
+        )
+        return dtcs
+
+    async def read_dtc_info_all_modules(
+        self,
+        modules: Optional[list] = None,
+        status_mask: int = 0xFF,
+    ) -> List[DTC]:
+        """
+        Read UDS DTCs from ALL discovered or standard modules.
+
+        Args:
+            modules: List of ECUModule objects (from discover_modules()).
+                     If None, probes standard addresses 0x7E0-0x7E7.
+            status_mask: UDS status mask (0xFF = all DTCs)
+
+        Returns:
+            Combined, deduplicated list of DTC objects from all modules
+        """
+        self._ensure_connected()
+        dtcs = await self._protocol.read_dtc_info_all_modules(
+            modules=modules, status_mask=status_mask
+        )
+
+        # Enrich descriptions
+        for dtc in dtcs:
+            ecu_tag = dtc.description if dtc.description.startswith('[') else ''
+            desc = get_dtc_description(dtc.code.split('-')[0])
+            dtc.description = f"{desc} {ecu_tag}".strip()
+
+        logger.info(f"UDS 0x19 all modules: {len(dtcs)} total DTCs")
+        return dtcs
+
+    async def read_dtc_snapshot(
+        self,
+        module_addr: int,
+        dtc_code: str,
+        bus: str = "HS-CAN",
+        record_number: int = 0xFF,
+    ) -> Dict[str, str]:
+        """
+        Read DTC snapshot (freeze frame) data for a specific DTC
+        via UDS 0x19 sub 0x04.
+
+        Args:
+            module_addr: CAN request address
+            dtc_code: DTC code string (e.g. "P0171" or "P0171-1A")
+            bus: Bus to use
+            record_number: Snapshot record number (0xFF = all records)
+
+        Returns:
+            Dict of snapshot DID label → value string
+        """
+        self._ensure_connected()
+        return await self._protocol.read_dtc_snapshot(
+            module_addr=module_addr,
+            dtc_code=dtc_code,
+            bus=bus,
+            record_number=record_number,
+        )
+
     # -------------------------------------------------------------------------
     # PID Reading
     # -------------------------------------------------------------------------
@@ -767,6 +862,28 @@ class ELM327Service:
                 continue
         
         return results
+
+    async def read_o2_monitoring(self) -> Dict[str, Any]:
+        """
+        Read Mode $05 O2 sensor monitoring test results.
+
+        Returns dict keyed by sensor location ("Bank 1, Sensor 1", etc.)
+        with lists of test results including pass/fail status.
+        """
+        self._ensure_connected()
+        return await self._protocol.read_o2_monitoring()
+
+    async def render_network_topology(self, vin: str = "", vehicle_info: str = "") -> str:
+        """
+        Render an interactive HTML topology map of the vehicle network.
+
+        Runs a module scan (if not already cached) then produces a
+        self-contained HTML page.
+        """
+        self._ensure_connected()
+        modules = await self._protocol.scan_all_modules(vin=self._vin or vin)
+        from .topology_map import render_topology_from_scan
+        return render_topology_from_scan(modules, vin=vin or self._vin or "", vehicle_info=vehicle_info)
 
 
 # Convenience function for simple scripts
