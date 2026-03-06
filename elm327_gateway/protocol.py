@@ -110,6 +110,8 @@ FORD_MS_CAN_ADDRESSES = {
     0x7CC: {"request": 0x7C4, "name": "DDM", "description": "Driver Door Module"},
     0x7CD: {"request": 0x7C5, "name": "PDM", "description": "Passenger Door Module"},
     0x7D8: {"request": 0x7D0, "name": "AWD", "description": "All-Wheel Drive Module"},
+    0x7AE: {"request": 0x7A6, "name": "FCIM", "description": "Front Controls Interface Module"},
+    0x709: {"request": 0x701, "name": "GPSM", "description": "GPS Module"},
 }
 
 # GM Enhanced CAN addresses (HS-CAN, 500 kbps, pins 6+14)
@@ -379,6 +381,10 @@ WMI_TO_MANUFACTURER = {
     "1ME": "ford", "2ME": "ford", "4M2": "ford",
     # Ford trucks
     "1FT": "ford", "3FT": "ford",
+    # Ford Malaysia (Mazda-Ford JV)
+    "MAJ": "ford",
+    # Ford special series (F-series trucks)
+    "1FW": "ford",
     # GM — Buick, Cadillac, Chevrolet, GMC, Oldsmobile, Pontiac, Saturn, Hummer
     "1G1": "gm", "1G2": "gm", "1G3": "gm", "1G4": "gm", "1G6": "gm",
     "1GC": "gm", "1GK": "gm", "1GM": "gm", "1GT": "gm", "1GY": "gm",
@@ -642,6 +648,16 @@ class OBDProtocol:
         Returns:
             17-character VIN string or None
         """
+        # Ensure adapter is in clean OBD-II broadcast state.
+        # After UDS/DID commands the adapter may have specific CAN headers
+        # and receive filters set, which causes standard Mode 09 to fail.
+        try:
+            await self.connection.send_command("ATSH7DF")   # OBD-II broadcast
+            await self.connection.send_command("ATCRA")     # Clear receive filter
+            await self.connection.send_command("ATH0")      # Headers off
+        except Exception:
+            pass  # Best effort — proceed with VIN request regardless
+
         # Request VIN (InfoType 02)
         response = await self.connection.send_command("0902", timeout=5.0)
         logger.info(f"VIN raw response: {repr(response)}")
@@ -1313,6 +1329,18 @@ class OBDProtocol:
         await self.connection.send_command(f"ATSH{module_addr:03X}")
         await self.connection.send_command(f"ATCRA{resp_addr:03X}")
 
+        # Extended timeout for non-HS-CAN buses (MS-CAN 125kbps, SW-CAN 33.3kbps)
+        # ATSTFF = 255 * 4ms ≈ 1020ms — needed for slow-to-wake modules
+        # (GEM, IPC, ABS, PSCM, RCM etc. often need >200ms on MS-CAN)
+        if switched_bus:
+            try:
+                await self.connection.send_command("ATSTFF")
+            except Exception:
+                try:
+                    await self.connection.send_command("AT ST FF")
+                except Exception:
+                    pass
+
         need_fc = switched_bus or not self._is_standard_obd_addr(module_addr)
         if need_fc:
             # Explicit Flow Control:
@@ -1357,6 +1385,11 @@ class OBDProtocol:
                 await self.connection.send_command("ATSP6")
             except Exception:
                 pass
+            # Restore default timeout (0x32 = 50 * 4ms = 200ms, standard for HS-CAN)
+            try:
+                await self.connection.send_command("ATST32")
+            except Exception:
+                pass
         try:
             await self.connection.send_command("ATSH7DF")
             await self.connection.send_command("ATCRA")
@@ -1373,10 +1406,13 @@ class OBDProtocol:
         if not upper:
             return False
         # These indicate NO module responded
-        dead_patterns = ["NO DATA", "ERROR", "UNABLE", "CAN ERROR", "BUS", "STOPPED", "?"]
+        dead_patterns = ["NO DATA", "ERROR", "UNABLE", "CAN ERROR", "BUS INIT", "STOPPED", "BUFFER FULL"]
         for pat in dead_patterns:
             if pat in upper:
                 return False
+        # "?" only counts as dead if it's the entire response
+        if upper.startswith("?"):
+            return False
         return True
     
     async def _read_module_dids(
@@ -1624,9 +1660,15 @@ class OBDProtocol:
             resp_addr = self._resolve_response_addr(module_addr)
             explicit_fc = await self._configure_can_target(module_addr, resp_addr, switched_bus)
             
+            # Enter extended diagnostic session for better module compatibility
+            try:
+                await self.connection.send_command("1003", timeout=3.0)
+            except Exception:
+                pass
+            
             # UDS Service 0x22: ReadDataByIdentifier
             cmd = f"22{did:04X}"
-            resp = await self.connection.send_command(cmd, timeout=5.0)
+            resp = await self.connection.send_command(cmd, timeout=8.0)
             
             if not resp or not self._is_live_response(resp):
                 logger.info(f"  DID {did:04X} from {module_addr:03X}: no response")
@@ -1743,11 +1785,17 @@ class OBDProtocol:
             resp_addr = self._resolve_response_addr(module_addr)
             explicit_fc = await self._configure_can_target(module_addr, resp_addr, switched_bus)
 
+            # Enter extended diagnostic session once for all DIDs
+            try:
+                await self.connection.send_command("1003", timeout=3.0)
+            except Exception:
+                pass
+
             resp_hex_str = f"{resp_addr:03X}"
             for did in dids:
                 try:
                     cmd = f"22{did:04X}"
-                    resp = await self.connection.send_command(cmd, timeout=5.0)
+                    resp = await self.connection.send_command(cmd, timeout=8.0)
                     
                     if not resp or not self._is_live_response(resp):
                         continue
