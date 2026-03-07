@@ -56,6 +56,17 @@ from .auto_update import (
     get_current_version,
     get_exe_path,
 )
+from .calibrations import (
+    get_calibration, list_calibrations, find_calibrations_for_operation,
+    find_calibrations_for_vehicle, CalibrationExecutor, CALIBRATION_LIBRARY,
+)
+from .data_logger import DataLogger, list_log_files, load_log_file, analyze_log, delete_log
+from .module_maps import (
+    identify_platform, get_platform_modules, get_fast_scan_addresses,
+    list_platforms, ALL_PLATFORMS,
+)
+from .test_procedures import PROCEDURE_LIBRARY, ProcedureRunner
+from .dtc_enhanced import get_enhanced_dtc_info, get_all_enhanced_codes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1751,6 +1762,182 @@ async def add_hypothesis(req: HypothesisRequest, user_id: str = "default"):
     session = get_session(user_id)
     session.add_hypothesis(req.diagnosis, req.confidence, req.reasoning)
     return {"status": "added", "hypotheses_count": len(session.hypotheses)}
+
+
+# =============================================================================
+# Calibrations & Relearn Routines
+# =============================================================================
+
+class CalibrationRequest(BaseModel):
+    routine_id: str
+    manufacturer: Optional[str] = None
+
+@app.get("/calibrations")
+async def list_calibrations_endpoint(category: Optional[str] = None, manufacturer: Optional[str] = None):
+    """List available calibration/relearn routines."""
+    cals = list_calibrations(category=category, manufacturer=manufacturer)
+    return {"calibrations": [{"id": c.id, "name": c.name, "category": c.category,
+                              "manufacturer": c.manufacturer, "description": c.description}
+                             for c in cals], "count": len(cals)}
+
+@app.get("/calibrations/{routine_id}")
+async def get_calibration_endpoint(routine_id: str):
+    """Get details of a specific calibration routine."""
+    cal = get_calibration(routine_id)
+    if not cal:
+        raise HTTPException(status_code=404, detail=f"Calibration '{routine_id}' not found")
+    return {"id": cal.id, "name": cal.name, "category": cal.category,
+            "manufacturer": cal.manufacturer, "description": cal.description,
+            "safety_level": cal.safety_level, "prerequisites": cal.prerequisites,
+            "steps": [s.__dict__ if hasattr(s, '__dict__') else str(s) for s in cal.steps]}
+
+@app.post("/calibrations/find")
+async def find_calibrations_endpoint(operation: Optional[str] = None, vin: Optional[str] = None):
+    """Find calibrations for a specific operation or vehicle."""
+    if operation:
+        results = find_calibrations_for_operation(operation)
+    elif vin:
+        results = find_calibrations_for_vehicle(vin)
+    else:
+        results = list_calibrations()
+    return {"calibrations": [{"id": c.id, "name": c.name, "category": c.category,
+                              "description": c.description} for c in results],
+            "count": len(results)}
+
+
+# =============================================================================
+# Data Logging
+# =============================================================================
+
+class LogStartRequest(BaseModel):
+    pids: list
+    interval_ms: int = 500
+    trigger_type: Optional[str] = None
+    trigger_value: Optional[str] = None
+
+class LogStopRequest(BaseModel):
+    session_id: Optional[str] = None
+
+@app.get("/logs")
+async def list_logs_endpoint():
+    """List saved data log files."""
+    files = list_log_files()
+    return {"logs": files, "count": len(files)}
+
+@app.get("/logs/{filename}")
+async def get_log_endpoint(filename: str):
+    """Load and return a specific log file."""
+    data = load_log_file(filename)
+    if not data:
+        raise HTTPException(status_code=404, detail=f"Log file '{filename}' not found")
+    return data
+
+@app.get("/logs/{filename}/analyze")
+async def analyze_log_endpoint(filename: str):
+    """Analyze a log file and return statistics."""
+    result = analyze_log(filename)
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Log file '{filename}' not found")
+    return result
+
+@app.delete("/logs/{filename}")
+async def delete_log_endpoint(filename: str):
+    """Delete a log file."""
+    success = delete_log(filename)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Log file '{filename}' not found")
+    return {"status": "deleted", "filename": filename}
+
+
+# =============================================================================
+# Module Maps / Platform Identification
+# =============================================================================
+
+@app.get("/platforms")
+async def list_platforms_endpoint():
+    """List all supported vehicle platforms."""
+    platforms = list_platforms()
+    return {"platforms": platforms, "count": len(platforms)}
+
+@app.get("/platforms/identify")
+async def identify_platform_endpoint(vin: Optional[str] = None, user_id: str = "default"):
+    """Identify vehicle platform from VIN."""
+    if not vin:
+        session = get_session(user_id)
+        vin = getattr(session, 'vin', None)
+    if not vin:
+        raise HTTPException(status_code=400, detail="No VIN provided or available in session")
+    platform = identify_platform({"vin": vin})
+    if not platform:
+        return {"platform": None, "message": "Platform not identified for this VIN"}
+    modules = get_platform_modules(platform)
+    addresses = get_fast_scan_addresses(platform)
+    return {"platform": platform, "modules": len(modules),
+            "fast_scan_addresses": [hex(a) for a in addresses]}
+
+@app.get("/platforms/{platform_id}/modules")
+async def get_platform_modules_endpoint(platform_id: str):
+    """Get modules for a specific platform."""
+    modules = get_platform_modules(platform_id)
+    if not modules:
+        raise HTTPException(status_code=404, detail=f"Platform '{platform_id}' not found")
+    return {"platform": platform_id, "modules": [m.__dict__ for m in modules],
+            "count": len(modules)}
+
+
+# =============================================================================
+# Test Procedures
+# =============================================================================
+
+@app.get("/procedures")
+async def list_procedures_endpoint(category: Optional[str] = None):
+    """List available test procedures."""
+    procedures = []
+    for pid, proc in PROCEDURE_LIBRARY.items():
+        if category and proc.category.value.lower() != category.lower():
+            continue
+        procedures.append({"id": pid, "name": proc.name, "category": proc.category.value,
+                          "description": proc.description, "safety_level": proc.safety_level.value,
+                          "steps": len(proc.steps)})
+    return {"procedures": procedures, "count": len(procedures)}
+
+@app.get("/procedures/{procedure_id}")
+async def get_procedure_endpoint(procedure_id: str):
+    """Get details of a specific test procedure."""
+    proc = PROCEDURE_LIBRARY.get(procedure_id)
+    if not proc:
+        raise HTTPException(status_code=404, detail=f"Procedure '{procedure_id}' not found")
+    return {"id": procedure_id, "name": proc.name, "category": proc.category.value,
+            "description": proc.description, "safety_level": proc.safety_level.value,
+            "prerequisites": proc.prerequisites,
+            "steps": [{"step_number": s.step_number, "type": s.step_type.value,
+                       "description": s.description} for s in proc.steps]}
+
+
+# =============================================================================
+# Enhanced DTC Lookup
+# =============================================================================
+
+@app.get("/dtc-enhanced/{code}")
+async def get_enhanced_dtc_endpoint(code: str):
+    """Get enhanced diagnostic info for a DTC code."""
+    info = get_enhanced_dtc_info(code)
+    if not info:
+        raise HTTPException(status_code=404, detail=f"No enhanced info for DTC '{code}'")
+    return {"code": info.code, "severity": info.severity,
+            "drivability_impact": info.drivability_impact,
+            "common_causes": info.common_causes,
+            "diagnostic_steps": info.diagnostic_steps,
+            "related_codes": info.related_codes,
+            "repair_difficulty": info.repair_difficulty,
+            "typical_cost_range": info.typical_cost_range,
+            "notes": info.notes}
+
+@app.get("/dtc-enhanced")
+async def list_enhanced_dtcs_endpoint():
+    """List all DTCs with enhanced info available."""
+    codes = sorted(get_all_enhanced_codes())
+    return {"codes": codes, "count": len(codes)}
 
 
 # =============================================================================
