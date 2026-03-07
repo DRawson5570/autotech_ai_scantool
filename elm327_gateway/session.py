@@ -122,6 +122,9 @@ class DiagnosticSession:
     hypotheses: List[Hypothesis] = field(default_factory=list)
     ruled_out: List[str] = field(default_factory=list)
     
+    # Freeze frame snapshot (populated by elm327_freeze_frame)
+    freeze_frame_data: Optional[Dict[str, Any]] = None
+    
     # Action log (what's been done)
     action_log: List[Tuple[datetime, str]] = field(default_factory=list)
     

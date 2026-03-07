@@ -1495,6 +1495,71 @@ async def network_topology():
 
 
 # =============================================================================
+# Live Data Dashboard Endpoint
+# =============================================================================
+
+@app.get("/live-dashboard", response_class=HTMLResponse)
+async def live_dashboard(group: str = "Essential"):
+    """Serve an interactive live data dashboard with real-time PID gauges.
+
+    Query params:
+        group: PID group name (Essential, Fuel System, Engine Performance,
+               O2 Sensors, Full Scan)
+    """
+    _require_connection()
+
+    try:
+        from .live_dashboard import render_live_dashboard, PID_GROUPS
+
+        pids = PID_GROUPS.get(group, PID_GROUPS["Essential"])
+
+        # Get vehicle info
+        vehicle_info = {}
+        try:
+            vin = await _elm.read_vin()
+            if vin:
+                vehicle_info["vin"] = vin
+                from .vin_decoder import decode_vin_full
+                info = decode_vin_full(vin)
+                if info:
+                    vehicle_info["year"] = info.get("year", "")
+                    vehicle_info["make"] = info.get("make", "")
+                    vehicle_info["model"] = info.get("model", "")
+        except Exception:
+            pass
+
+        # Read initial PIDs
+        initial_data = {}
+        try:
+            readings = await _elm.read_pids(pids)
+            for pid_name, reading in readings.items():
+                initial_data[pid_name] = {
+                    "value": reading.value,
+                    "unit": reading.unit,
+                }
+        except Exception:
+            pass
+
+        # Gateway URL = self
+        import socket
+        host = socket.gethostname()
+        port = app.state.port if hasattr(app.state, "port") else 8327
+        gateway_url = f"http://{host}:{port}"
+
+        html = render_live_dashboard(
+            pids=pids,
+            vehicle_info=vehicle_info,
+            gateway_url=gateway_url,
+            refresh_interval=1.0,
+            initial_data=initial_data,
+        )
+        return HTMLResponse(content=html)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
 # Update & Version Endpoints
 # =============================================================================
 
